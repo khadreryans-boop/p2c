@@ -1,0 +1,543 @@
+package main
+
+import (
+	"bufio"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fastjson"
+)
+
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 OPR/126.0.0.0"
+
+const (
+	host           = "app.send.tg"
+	wsURL          = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
+	takePathPrefix = "/internal/v1/p2c/payments/take/"
+	origin         = "https://app.send.tg"
+	referer        = "https://app.send.tg/p2c/orders"
+	pauseSeconds   = 20
+)
+
+const numClients = 20
+
+// --- gates ---
+var (
+	pauseTaking atomic.Bool
+
+	// лимит на обработку ордеров: 5/сек
+	orderTokens = make(chan struct{}, 5)
+)
+
+type orderEvent struct {
+	id     string
+	wsTime time.Time
+	amtStr string
+}
+
+var orders = make(chan orderEvent, 256)
+var fj fastjson.Parser
+
+type clientSlot struct {
+	name   string
+	client *fasthttp.Client
+
+	// EWMA RTT (микросекунды)
+	ewmaUs  atomic.Uint64
+	samples atomic.Uint64
+}
+
+var slots [numClients]*clientSlot
+
+type slotView struct {
+	s  *clientSlot
+	us uint64
+}
+
+// --- EWMA коэффициенты ---
+const (
+	aNumer = 2  // 0.2
+	aDenom = 10 // 0.2
+)
+
+func startOrderLimiter() {
+	t := time.NewTicker(200 * time.Millisecond)
+	go func() {
+		for range t.C {
+			select {
+			case orderTokens <- struct{}{}:
+			default:
+			}
+		}
+	}()
+}
+
+// parseDecimalToCents parses like "367.83" -> 36783
+func parseDecimalToCents(s string) (cents int64, ok bool) {
+	if s == "" {
+		return 0, false
+	}
+	var whole int64
+	var frac int64
+	var fracDigits int
+	seenDot := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' {
+			if seenDot {
+				return 0, false
+			}
+			seenDot = true
+			continue
+		}
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := int64(c - '0')
+
+		if !seenDot {
+			whole = whole*10 + d
+			continue
+		}
+		if fracDigits < 2 {
+			frac = frac*10 + d
+			fracDigits++
+		}
+	}
+
+	if fracDigits == 0 {
+		frac = 0
+	} else if fracDigits == 1 {
+		frac *= 10
+	}
+
+	return whole*100 + frac, true
+}
+
+func makeFastClient() *fasthttp.Client {
+	dialer := &net.Dialer{
+		Timeout:   500 * time.Millisecond,
+		KeepAlive: 30 * time.Second,
+	}
+
+	return &fasthttp.Client{
+		Name:                          UA,
+		ReadTimeout:                   1200 * time.Millisecond,
+		WriteTimeout:                  1200 * time.Millisecond,
+		MaxConnsPerHost:               64,
+		MaxIdleConnDuration:           90 * time.Second,
+		DisableHeaderNamesNormalizing: true,
+		DisablePathNormalizing:        true,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: host,
+		},
+		Dial: func(addr string) (net.Conn, error) {
+			return dialer.Dial("tcp", addr)
+		},
+	}
+}
+
+func warmupSlot(slot *clientSlot) {
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI("https://" + host + "/p2c/orders")
+	req.Header.SetMethod("GET")
+	req.Header.Set("User-Agent", UA)
+
+	t0 := time.Now()
+	err := slot.client.DoTimeout(req, resp, 1500*time.Millisecond)
+	dur := time.Since(t0)
+
+	// EWMA считаем даже при ошибке (штраф)
+	us := uint64(dur.Microseconds())
+	if err != nil {
+		us = 2_000_000
+	}
+
+	old := slot.ewmaUs.Load()
+	if old == 0 {
+		slot.ewmaUs.Store(us)
+	} else {
+		newVal := (old*(aDenom-aNumer) + us*aNumer) / aDenom
+		slot.ewmaUs.Store(newVal)
+	}
+	slot.samples.Add(1)
+}
+
+func pickTopSlots(n int) []*clientSlot {
+	views := make([]slotView, 0, numClients)
+	for i := 0; i < numClients; i++ {
+		s := slots[i]
+		us := s.ewmaUs.Load()
+		if us == 0 {
+			// непрогретые вниз
+			us = 9_000_000_000
+		}
+		views = append(views, slotView{s: s, us: us})
+	}
+
+	sort.Slice(views, func(i, j int) bool { return views[i].us < views[j].us })
+
+	if n > len(views) {
+		n = len(views)
+	}
+	out := make([]*clientSlot, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, views[i].s)
+	}
+	return out
+}
+
+func doTakeOnce(client *fasthttp.Client, accessCookie, id string) (code int, err error) {
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI("https://" + host + takePathPrefix + id)
+	req.Header.SetMethod("POST")
+	req.Header.SetHost(host)
+
+	req.Header.Set("User-Agent", UA)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", referer)
+	req.Header.Set("Cookie", accessCookie)
+
+	req.SetBodyRaw([]byte(`{}`))
+
+	err = client.DoRedirects(req, resp, 5)
+	if err != nil {
+		return 0, err
+	}
+	return resp.StatusCode(), nil
+}
+
+func takeOrderFast(slot *clientSlot, accessCookie string, ev orderEvent, ewmaAtPickMs float64) {
+	if pauseTaking.Load() {
+		return
+	}
+
+	// ms от прихода WS пакета до старта HTTP
+	preMs := time.Since(ev.wsTime).Milliseconds()
+
+	t0 := time.Now()
+	code, err := doTakeOnce(slot.client, accessCookie, ev.id)
+	dur := time.Since(t0)
+
+	rttMs := dur.Milliseconds()
+	e2eMs := time.Since(ev.wsTime).Milliseconds()
+
+	// обновляем EWMA по фактическому RTT take (штраф если err)
+	us := uint64(dur.Microseconds())
+	if err != nil {
+		us = 2_000_000
+	}
+	old := slot.ewmaUs.Load()
+	if old == 0 {
+		slot.ewmaUs.Store(us)
+	} else {
+		newVal := (old*(aDenom-aNumer) + us*aNumer) / aDenom
+		slot.ewmaUs.Store(newVal)
+	}
+	slot.samples.Add(1)
+
+	if err != nil {
+		return
+	}
+
+	// выводим только 400 и успех
+	if code == 400 {
+		fmt.Printf("TAKE %s HTTP=%d ewma=%.0fms pre=%dms rtt=%dms e2e=%dms id=%s\n",
+			slot.name, code, ewmaAtPickMs, preMs, rttMs, e2eMs, ev.id)
+		return
+	}
+
+	if code == 200 {
+		fmt.Printf("ORDER TAKEN ✅ (%s)\n", ev.id)
+
+		pauseTaking.Store(true)
+		go func() {
+			time.Sleep(pauseSeconds * time.Second)
+			pauseTaking.Store(false)
+		}()
+	}
+}
+
+// -------------------------
+// Socket.IO helpers
+// -------------------------
+func splitPackets(s string) []string {
+	if !strings.Contains(s, "\x1e") {
+		return []string{s}
+	}
+	parts := strings.Split(s, "\x1e")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func handleSocketIOMessage(minCents int64, baseTime time.Time, msg string) {
+	if msg == "2" || !strings.HasPrefix(msg, "42") {
+		return
+	}
+
+	v, err := fj.Parse(msg[2:])
+	if err != nil {
+		return
+	}
+
+	arr := v.GetArray()
+	if len(arr) < 2 {
+		return
+	}
+
+	evName := string(arr[0].GetStringBytes())
+	if evName == "" {
+		return
+	}
+	if evName == "list:initialize" || evName == "list:snapshot" || evName != "list:update" {
+		return
+	}
+
+	ops := arr[1].GetArray()
+	if len(ops) == 0 || pauseTaking.Load() {
+		return
+	}
+
+	for _, item := range ops {
+		if item == nil {
+			continue
+		}
+		if string(item.GetStringBytes("op")) != "add" {
+			continue
+		}
+		if pauseTaking.Load() {
+			return
+		}
+
+		data := item.Get("data")
+		if data == nil {
+			continue
+		}
+
+		id := string(data.GetStringBytes("id"))
+		if id == "" {
+			continue
+		}
+
+		amtStr := string(data.GetStringBytes("in_amount"))
+
+		if minCents > 0 {
+			cents, ok := parseDecimalToCents(amtStr)
+			if !ok || cents < minCents {
+				continue
+			}
+		}
+
+		if amtStr != "" {
+			fmt.Println("NEW ORDER:", id, "in_amount:", amtStr)
+		} else {
+			fmt.Println("NEW ORDER:", id)
+		}
+
+		evObj := orderEvent{id: id, wsTime: baseTime, amtStr: amtStr}
+
+		// drop-old keep-new
+		select {
+		case orders <- evObj:
+		default:
+			select {
+			case <-orders:
+			default:
+			}
+			select {
+			case orders <- evObj:
+			default:
+			}
+		}
+	}
+}
+
+// -------------------------
+// main
+// -------------------------
+func main() {
+	in := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Enter access_token cookie (format: access_token=...):\n> ")
+	accessCookie, _ := in.ReadString('\n')
+	accessCookie = strings.TrimSpace(accessCookie)
+
+	if accessCookie == "" {
+		fmt.Println("Cookie is empty. Exit.")
+		return
+	}
+	if !strings.HasPrefix(accessCookie, "access_token=") {
+		fmt.Println("Expected format: access_token=...")
+		return
+	}
+
+	fmt.Print("Enter MIN in_amount (e.g. 300). 0 = no filter:\n> ")
+	minLine, _ := in.ReadString('\n')
+	minLine = strings.TrimSpace(minLine)
+
+	minCents := int64(0)
+	if minLine != "" {
+		f, err := strconv.ParseFloat(minLine, 64)
+		if err != nil {
+			fmt.Println("Bad MIN amount, expected number. Exit.")
+			return
+		}
+		minCents = int64(f * 100.0)
+	}
+
+	startOrderLimiter()
+
+	// 20 клиентов
+	for i := 0; i < numClients; i++ {
+		slots[i] = &clientSlot{
+			name:   fmt.Sprintf("C%d", i+1),
+			client: makeFastClient(),
+		}
+	}
+
+	// прогрев EWMA (без логов)
+	for i := 0; i < numClients; i++ {
+		s := slots[i]
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				warmupSlot(s)
+			}
+		}()
+	}
+
+	// ордера -> take топ-4 по EWMA
+	go func() {
+		for ev := range orders {
+			<-orderTokens
+
+			best := pickTopSlots(4)
+			for _, s := range best {
+				ewmaMs := float64(s.ewmaUs.Load()) / 1000.0
+				go takeOrderFast(s, accessCookie, ev, ewmaMs)
+			}
+
+		}
+	}()
+
+	// --- WebSocket dial ---
+	wsDialer := websocket.Dialer{
+		HandshakeTimeout:  6 * time.Second,
+		EnableCompression: false,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: host,
+		},
+	}
+
+	header := http.Header{}
+	header.Set("Host", host)
+	header.Set("Origin", origin)
+	header.Set("User-Agent", UA)
+	header.Set("Cookie", accessCookie)
+	header.Set("Pragma", "no-cache")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
+
+	ws, resp, err := wsDialer.Dial(wsURL, header)
+	if err != nil {
+		if resp != nil {
+			fmt.Println("WS dial failed, HTTP status:", resp.Status)
+		}
+		fmt.Println("WS dial err:", err)
+		return
+	}
+	defer ws.Close()
+
+	pongWait := 60 * time.Second
+	ws.SetReadLimit(1 << 20)
+	ws.SetReadDeadline(time.Now().Add(pongWait))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	ws.SetPingHandler(func(appData string) error {
+		_ = ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(2*time.Second))
+		ws.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	stopPing := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_ = ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(2*time.Second))
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+	defer close(stopPing)
+
+	// OPEN packet
+	_, _, err = ws.ReadMessage()
+	if err != nil {
+		return
+	}
+
+	_ = ws.WriteMessage(websocket.TextMessage, []byte("40"))
+
+	// ACK
+	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = ws.ReadMessage()
+	ws.SetReadDeadline(time.Now().Add(pongWait))
+	if err != nil {
+		return
+	}
+
+	_ = ws.WriteMessage(websocket.TextMessage, []byte(`42["list:initialize"]`))
+	_ = ws.WriteMessage(websocket.TextMessage, []byte(`42["list:snapshot",[]]`))
+
+	for {
+		_, raw, err := ws.ReadMessage()
+		if err != nil {
+			return
+		}
+		wsNow := time.Now()
+
+		s := string(raw)
+		for _, pkt := range splitPackets(s) {
+			if pkt == "2" {
+				_ = ws.WriteMessage(websocket.TextMessage, []byte("3"))
+				continue
+			}
+			handleSocketIOMessage(minCents, wsNow, pkt)
+		}
+	}
+}

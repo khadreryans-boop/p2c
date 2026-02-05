@@ -1,0 +1,60 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+repositories {
+    mavenCentral()
+    gradlePluginPortal() // обязательно для Shadow
+}
+
+group = 'evo.developers.ru.client'
+version = '1.0-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+dependencies {
+
+    implementation 'org.apache.httpcomponents:httpclient:4.5.14'
+
+    implementation 'org.glassfish.jaxb:jaxb-runtime:4.0.3'
+    implementation 'javax.xml.bind:jaxb-api:2.4.0-b180830.0359'
+
+    implementation 'org.telegram:telegrambots:6.9.7.1'
+    implementation 'org.telegram:telegrambots-meta:6.9.7.1'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.20.0'
+    implementation 'io.socket:socket.io-client:2.1.2'
+    implementation 'org.apache.httpcomponents.client5:httpclient5:5.3.1'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    
+    // SLF4J logging implementation
+    implementation 'org.slf4j:slf4j-simple:2.0.9'
+    
+    compileOnly 'org.projectlombok:lombok:1.18.34'
+    annotationProcessor 'org.projectlombok:lombok:1.18.34'
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    mainClass = 'evo.developers.ru.client.bot.FastClientBot'
+}
+
+shadowJar {
+    archiveBaseName.set('FastClientBot')
+    archiveClassifier.set('')
+    archiveVersion.set('1.0-SNAPSHOT')
+    manifest {
+        attributes 'Main-Class': 'evo.developers.ru.client.bot.FastClientBot'
+    }
+}
+test {
+    useJUnitPlatform()
+}
