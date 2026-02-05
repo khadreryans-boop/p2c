@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -79,9 +80,8 @@ func (c *httpClient) connect() error {
 		return err
 	}
 
-	// SetNoDelay через underlying TCP conn
-	if err := conn.NetConn().(*net.TCPConn).SetNoDelay(true); err != nil {
-		// ignore
+	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
 	}
 
 	c.conn = conn
@@ -130,7 +130,6 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration) {
 
 	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	// build request directly
 	c.bw.Write(takeReqTemplate)
 	c.bw.WriteString(orderID)
 	c.bw.Write(takeReqSuffix)
@@ -143,7 +142,6 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration) {
 		return 0, 0
 	}
 
-	// read response
 	line, err := c.br.ReadString('\n')
 	dur := time.Since(start)
 
@@ -152,21 +150,18 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration) {
 		return 0, dur
 	}
 
-	// parse status: "HTTP/1.1 200 OK"
 	if len(line) < 12 {
 		c.reconnect()
 		return 0, dur
 	}
 	code, _ := strconv.Atoi(line[9:12])
 
-	// drain response body
 	for {
 		line, err := c.br.ReadString('\n')
 		if err != nil || line == "\r\n" {
 			break
 		}
 	}
-	// read body (assume small)
 	body := make([]byte, 512)
 	c.br.Read(body)
 
@@ -343,7 +338,22 @@ func speculativeParse(msg []byte, wsTime time.Time, minCents int64) {
 
 // ============ WebSocket (gobwas/ws) ============
 
-func connectWebSocket(cookie string) (net.Conn, error) {
+type wsConn struct {
+	conn    net.Conn
+	writeMu sync.Mutex
+}
+
+func (w *wsConn) write(msg []byte) error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return wsutil.WriteClientText(w.conn, msg)
+}
+
+func (w *wsConn) read() ([]byte, ws.OpCode, error) {
+	return wsutil.ReadServerData(w.conn)
+}
+
+func connectWebSocket(cookie string) (*wsConn, error) {
 	dialer := ws.Dialer{
 		Header: ws.HandshakeHeaderHTTP(http.Header{
 			"Host":            []string{host},
@@ -379,21 +389,19 @@ func connectWebSocket(cookie string) (net.Conn, error) {
 		return nil, err
 	}
 
-	return conn, nil
+	return &wsConn{conn: conn}, nil
 }
 
-func wsWrite(conn net.Conn, msg []byte) error {
-	return wsutil.WriteClientText(conn, msg)
-}
-
-func wsRead(conn net.Conn) ([]byte, error) {
-	msg, err := wsutil.ReadServerText(conn)
-	return msg, err
+// Engine.IO open packet
+type eioOpen struct {
+	Sid          string `json:"sid"`
+	PingInterval int    `json:"pingInterval"`
+	PingTimeout  int    `json:"pingTimeout"`
 }
 
 func runWebSocket(cookie string, minCents int64) {
 	for {
-		conn, err := connectWebSocket(cookie)
+		wsc, err := connectWebSocket(cookie)
 		if err != nil {
 			fmt.Println("WS connect error:", err)
 			time.Sleep(2 * time.Second)
@@ -402,48 +410,77 @@ func runWebSocket(cookie string, minCents int64) {
 
 		fmt.Println("🔌 WebSocket connected")
 
-		// Engine.IO handshake
-		msg, err := wsRead(conn)
+		// Read Engine.IO OPEN packet (type 0)
+		msg, _, err := wsc.read()
 		if err != nil {
-			conn.Close()
+			fmt.Println("Failed to read OPEN:", err)
+			wsc.conn.Close()
 			continue
 		}
-		_ = msg // OPEN packet
 
-		// Socket.IO connect
-		wsWrite(conn, []byte("40"))
-
-		msg, err = wsRead(conn)
-		if err != nil {
-			conn.Close()
+		if len(msg) == 0 || msg[0] != '0' {
+			fmt.Println("Expected OPEN packet, got:", string(msg))
+			wsc.conn.Close()
 			continue
 		}
-		_ = msg // ACK
 
-		// Subscribe
-		wsWrite(conn, []byte(`42["list:initialize"]`))
-		wsWrite(conn, []byte(`42["list:snapshot",[]]`))
+		// Parse ping interval from OPEN packet
+		var openData eioOpen
+		if err := json.Unmarshal(msg[1:], &openData); err != nil {
+			fmt.Println("Failed to parse OPEN:", err)
+			wsc.conn.Close()
+			continue
+		}
+
+		pingInterval := time.Duration(openData.PingInterval) * time.Millisecond
+		pingTimeout := time.Duration(openData.PingTimeout) * time.Millisecond
+		fmt.Printf("📡 EIO: pingInterval=%v, pingTimeout=%v\n", pingInterval, pingTimeout)
+
+		// Socket.IO connect (namespace /)
+		if err := wsc.write([]byte("40")); err != nil {
+			wsc.conn.Close()
+			continue
+		}
+
+		// Read Socket.IO ACK
+		msg, _, err = wsc.read()
+		if err != nil {
+			fmt.Println("Failed to read SIO ACK:", err)
+			wsc.conn.Close()
+			continue
+		}
+		fmt.Println("📡 SIO ACK:", string(msg))
+
+		// Subscribe to list
+		wsc.write([]byte(`42["list:initialize"]`))
+		wsc.write([]byte(`42["list:snapshot",[]]`))
 
 		fmt.Println("🚀 FAST MODE ACTIVE")
 
-		// Ping goroutine
+		// Ping sender goroutine - uses server's pingInterval
 		stopPing := make(chan struct{})
 		go func() {
-			ticker := time.NewTicker(25 * time.Second)
+			// Send ping slightly before the interval to be safe
+			ticker := time.NewTicker(pingInterval - 500*time.Millisecond)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
-					wsWrite(conn, []byte("2"))
+					if err := wsc.write([]byte("2")); err != nil {
+						return
+					}
 				case <-stopPing:
 					return
 				}
 			}
 		}()
 
+		// Set read deadline based on ping timeout
+		wsc.conn.SetReadDeadline(time.Now().Add(pingInterval + pingTimeout))
+
 		// Main read loop
 		for {
-			msg, err := wsRead(conn)
+			msg, opcode, err := wsc.read()
 			wsTime := time.Now()
 
 			if err != nil {
@@ -451,23 +488,44 @@ func runWebSocket(cookie string, minCents int64) {
 				break
 			}
 
-			// Engine.IO ping
-			if len(msg) == 1 && msg[0] == '2' {
-				wsWrite(conn, []byte("3"))
+			// Reset deadline on any message
+			wsc.conn.SetReadDeadline(time.Now().Add(pingInterval + pingTimeout))
+
+			// Skip binary/close frames
+			if opcode != ws.OpText {
 				continue
 			}
 
-			// Socket.IO message
-			if len(msg) > 2 && msg[0] == '4' && msg[1] == '2' {
-				msgCopy := make([]byte, len(msg)-2)
-				copy(msgCopy, msg[2:])
-				go speculativeParse(msgCopy, wsTime, minCents)
+			if len(msg) == 0 {
+				continue
+			}
+
+			// Engine.IO message types:
+			// 2 = ping (server asks us to respond)
+			// 3 = pong (response to our ping)
+			// 4 = message (Socket.IO)
+
+			switch msg[0] {
+			case '2': // Server PING -> respond with PONG immediately
+				wsc.write([]byte("3"))
+				continue
+
+			case '3': // Server PONG (response to our ping)
+				continue
+
+			case '4': // Socket.IO message
+				if len(msg) > 1 && msg[1] == '2' {
+					// Event message 42[...]
+					msgCopy := make([]byte, len(msg)-2)
+					copy(msgCopy, msg[2:])
+					go speculativeParse(msgCopy, wsTime, minCents)
+				}
 			}
 		}
 
 		close(stopPing)
-		conn.Close()
-		fmt.Println("🔄 Reconnecting...")
+		wsc.conn.Close()
+		fmt.Println("🔄 Reconnecting in 1s...")
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -505,7 +563,6 @@ func main() {
 
 	fmt.Println("⏳ Initializing", numClients, "HTTP clients...")
 
-	// Init HTTP clients
 	var wg sync.WaitGroup
 	for i := 0; i < numClients; i++ {
 		clients[i] = newHTTPClient(fmt.Sprintf("C%02d", i+1))
@@ -539,6 +596,5 @@ func main() {
 		}
 	}()
 
-	// Run WebSocket
 	runWebSocket(accessCookie, minCents)
 }
