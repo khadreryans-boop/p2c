@@ -148,7 +148,7 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 	return code, dur, nil
 }
 
-// Warmup через HEAD (не считается в rate limit)
+// Warmup через POST /accounts (прогревает бэкенд, не лимитируется)
 func (t *taker) warmup() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -159,10 +159,21 @@ func (t *taker) warmup() {
 
 	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	// HEAD запрос - прогревает TCP/TLS/CDN
-	t.bw.WriteString("HEAD /p2c HTTP/1.1\r\nHost: " + host + "\r\nCookie: " + cookie + "\r\nConnection: keep-alive\r\n\r\n")
+	// POST на /accounts - прогревает путь до бэкенда
+	req := "POST /internal/v1/p2c/accounts HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Cookie: " + cookie + "\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Content-Length: 2\r\n" +
+		"Connection: keep-alive\r\n\r\n{}"
 
 	start := time.Now()
+	if _, err := t.bw.WriteString(req); err != nil {
+		t.conn.Close()
+		t.conn = nil
+		t.ready.Store(false)
+		return
+	}
 	if err := t.bw.Flush(); err != nil {
 		t.conn.Close()
 		t.conn = nil
@@ -180,12 +191,22 @@ func (t *taker) warmup() {
 		return
 	}
 
-	// Drain headers
+	// Drain headers and get content-length
+	contentLen := 0
 	for {
 		line, _ := t.br.ReadString('\n')
 		if line == "\r\n" || line == "" {
 			break
 		}
+		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+			fmt.Sscanf(line[15:], "%d", &contentLen)
+		}
+	}
+
+	// Drain body
+	if contentLen > 0 {
+		body := make([]byte, contentLen)
+		io.ReadFull(t.br, body)
 	}
 
 	t.lastRtt.Store(uint64(dur.Milliseconds()))
@@ -532,7 +553,7 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | warmup via HEAD (500ms)\n", numWebSockets, numTakers)
+	fmt.Printf("  %d WS | %d takers | warmup via POST /accounts (500ms)\n", numWebSockets, numTakers)
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
