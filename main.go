@@ -10,7 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,112 +19,54 @@ import (
 )
 
 const (
-	host   = "app.send.tg"
-	wsPath = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
+	host     = "app.send.tg"
+	wsPath   = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
+	pollPath = "/internal/v1/p2c-socket/?EIO=4&transport=polling"
 )
 
 var cookie string
 
-// DNS servers to try
-var dnsServers = []string{
-	"1.1.1.1:53",        // Cloudflare
-	"1.0.0.1:53",        // Cloudflare secondary
-	"8.8.8.8:53",        // Google
-	"8.8.4.4:53",        // Google secondary
-	"9.9.9.9:53",        // Quad9
-	"208.67.222.222:53", // OpenDNS
-	"208.67.220.220:53", // OpenDNS secondary
-	"",                  // System default
-}
-
-// Track results
 var (
 	mu         sync.Mutex
-	orderFirst = make(map[string]int) // order_id -> ws_id who saw first
+	orderFirst = make(map[string]string)
 	orderTime  = make(map[string]time.Time)
-	wsWins     = make(map[int]int)     // ws_id -> win count
-	wsDelays   = make(map[int][]int64) // ws_id -> delays when not first (ms)
-	wsIPs      = make(map[int]string)  // ws_id -> IP
+	wsWins     int
+	pollWins   int
 )
 
-func recordOrder(orderID string, wsID int) {
+func recordOrder(id, source string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if firstWS, exists := orderFirst[orderID]; exists {
-		// Already seen
-		delay := time.Since(orderTime[orderID]).Milliseconds()
-		wsDelays[wsID] = append(wsDelays[wsID], delay)
-		fmt.Printf("   WS%02d saw %s +%dms (first: WS%02d)\n", wsID, orderID[:12], delay, firstWS)
+	if first, exists := orderFirst[id]; exists {
+		delay := time.Since(orderTime[id]).Milliseconds()
+		fmt.Printf("   %s saw %s +%dms (first: %s)\n", source, id[:12], delay, first)
 		return
 	}
 
-	// First!
-	orderFirst[orderID] = wsID
-	orderTime[orderID] = time.Now()
-	wsWins[wsID]++
+	orderFirst[id] = source
+	orderTime[id] = time.Now()
 
-	fmt.Printf("🥇 WS%02d FIRST: %s (wins: %d, ip: %s)\n", wsID, orderID[:12], wsWins[wsID], wsIPs[wsID])
-}
-
-func resolveAllIPs() []string {
-	ipSet := make(map[string]bool)
-	var allIPs []string
-
-	for _, dns := range dnsServers {
-		var ips []string
-		var err error
-
-		if dns == "" {
-			// System default
-			ips, err = net.LookupHost(host)
-		} else {
-			// Custom DNS
-			resolver := &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 3 * time.Second}
-					return d.DialContext(ctx, "udp", dns)
-				},
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			ips, err = resolver.LookupHost(ctx, host)
-			cancel()
-		}
-
-		if err != nil {
-			continue
-		}
-
-		for _, ip := range ips {
-			if !ipSet[ip] {
-				ipSet[ip] = true
-				allIPs = append(allIPs, ip)
-				source := dns
-				if source == "" {
-					source = "system"
-				}
-				fmt.Printf("  Found IP: %s (from %s)\n", ip, source)
-			}
-		}
+	if source == "WS" {
+		wsWins++
+	} else {
+		pollWins++
 	}
 
-	return allIPs
+	fmt.Printf("🥇 %s FIRST: %s (WS:%d POLL:%d)\n", source, id[:12], wsWins, pollWins)
 }
 
-func runWS(wsID int, ip string) {
-	wsIPs[wsID] = ip
-	ipShort := ip[strings.LastIndex(ip, ".")+1:]
+// ============ WebSocket ============
 
+func runWS(ip string) {
 	for {
 		conn, err := connectWS(ip)
 		if err != nil {
-			fmt.Printf("[WS%02d@%s] connect err: %v\n", wsID, ipShort, err)
+			fmt.Printf("[WS] connect err: %v\n", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// Handshake
 		readFrame(conn)
 		writeFrame(conn, []byte("40"))
 		readFrame(conn)
@@ -134,12 +76,12 @@ func runWS(wsID int, ip string) {
 		time.Sleep(30 * time.Millisecond)
 		writeFrame(conn, []byte(`42["list:snapshot",[]]`))
 
-		fmt.Printf("[WS%02d@%s] 🚀 connected\n", wsID, ipShort)
+		fmt.Printf("[WS] 🚀 connected\n")
 
 		for {
 			data, op, err := readFrame(conn)
 			if err != nil {
-				fmt.Printf("[WS%02d] disconnected: %v\n", wsID, err)
+				fmt.Printf("[WS] err: %v\n", err)
 				break
 			}
 
@@ -149,7 +91,7 @@ func runWS(wsID int, ip string) {
 					continue
 				}
 				if len(data) > 2 && data[0] == '4' && data[1] == '2' {
-					parseOrder(data[2:], wsID)
+					parseOrder(data[2:], "WS")
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -209,7 +151,219 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
-func parseOrder(data []byte, wsID int) {
+// ============ Long Polling ============
+
+func runPoll(ip string) {
+	for {
+		err := doPollSession(ip)
+		if err != nil {
+			fmt.Printf("[POLL] session error: %v\n", err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func doPollSession(ip string) error {
+	// Connect
+	conn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 5 * time.Second},
+		"tcp",
+		ip+":443",
+		&tls.Config{ServerName: host},
+	)
+	if err != nil {
+		return fmt.Errorf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	br := bufio.NewReaderSize(conn, 16384)
+	bw := bufio.NewWriterSize(conn, 4096)
+
+	// Step 1: Handshake
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	fmt.Fprintf(bw, "GET %s HTTP/1.1\r\n", pollPath)
+	fmt.Fprintf(bw, "Host: %s\r\n", host)
+	fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+	fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+	fmt.Fprintf(bw, "\r\n")
+	bw.Flush()
+
+	body, code := readHTTP(br)
+	if code != 200 {
+		return fmt.Errorf("handshake: %d", code)
+	}
+
+	sidIdx := bytes.Index(body, []byte(`"sid":"`))
+	if sidIdx == -1 {
+		return fmt.Errorf("no sid")
+	}
+	sid := string(body[sidIdx+7 : sidIdx+7+bytes.IndexByte(body[sidIdx+7:], '"')])
+
+	// Step 2: Send 40
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	msg := "40"
+	fmt.Fprintf(bw, "POST %s&sid=%s HTTP/1.1\r\n", pollPath, sid)
+	fmt.Fprintf(bw, "Host: %s\r\n", host)
+	fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+	fmt.Fprintf(bw, "Content-Type: text/plain;charset=UTF-8\r\n")
+	fmt.Fprintf(bw, "Content-Length: %d\r\n", len(msg))
+	fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+	fmt.Fprintf(bw, "\r\n%s", msg)
+	bw.Flush()
+
+	_, code = readHTTP(br)
+	if code != 200 {
+		return fmt.Errorf("send 40: %d", code)
+	}
+
+	// Step 3: Poll for ACK
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	fmt.Fprintf(bw, "GET %s&sid=%s HTTP/1.1\r\n", pollPath, sid)
+	fmt.Fprintf(bw, "Host: %s\r\n", host)
+	fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+	fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+	fmt.Fprintf(bw, "\r\n")
+	bw.Flush()
+
+	_, code = readHTTP(br)
+	if code != 200 {
+		return fmt.Errorf("ack: %d", code)
+	}
+
+	// Step 4: Initialize
+	time.Sleep(30 * time.Millisecond)
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	msg = `42["list:initialize"]`
+	fmt.Fprintf(bw, "POST %s&sid=%s HTTP/1.1\r\n", pollPath, sid)
+	fmt.Fprintf(bw, "Host: %s\r\n", host)
+	fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+	fmt.Fprintf(bw, "Content-Type: text/plain;charset=UTF-8\r\n")
+	fmt.Fprintf(bw, "Content-Length: %d\r\n", len(msg))
+	fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+	fmt.Fprintf(bw, "\r\n%s", msg)
+	bw.Flush()
+	readHTTP(br)
+
+	time.Sleep(30 * time.Millisecond)
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	msg = `42["list:snapshot",[]]`
+	fmt.Fprintf(bw, "POST %s&sid=%s HTTP/1.1\r\n", pollPath, sid)
+	fmt.Fprintf(bw, "Host: %s\r\n", host)
+	fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+	fmt.Fprintf(bw, "Content-Type: text/plain;charset=UTF-8\r\n")
+	fmt.Fprintf(bw, "Content-Length: %d\r\n", len(msg))
+	fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+	fmt.Fprintf(bw, "\r\n%s", msg)
+	bw.Flush()
+	readHTTP(br)
+
+	fmt.Printf("[POLL] 🚀 connected (sid=%s...)\n", sid[:12])
+
+	// Poll loop
+	pollCount := 0
+	for {
+		conn.SetDeadline(time.Now().Add(30 * time.Second))
+		fmt.Fprintf(bw, "GET %s&sid=%s HTTP/1.1\r\n", pollPath, sid)
+		fmt.Fprintf(bw, "Host: %s\r\n", host)
+		fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+		fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+		fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+		fmt.Fprintf(bw, "\r\n")
+		bw.Flush()
+
+		body, code = readHTTP(br)
+		pollCount++
+
+		if code != 200 {
+			return fmt.Errorf("poll #%d: %d", pollCount, code)
+		}
+
+		// Ping
+		if len(body) == 1 && body[0] == '2' {
+			conn.SetDeadline(time.Now().Add(5 * time.Second))
+			fmt.Fprintf(bw, "POST %s&sid=%s HTTP/1.1\r\n", pollPath, sid)
+			fmt.Fprintf(bw, "Host: %s\r\n", host)
+			fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
+			fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+			fmt.Fprintf(bw, "Content-Type: text/plain;charset=UTF-8\r\n")
+			fmt.Fprintf(bw, "Content-Length: 1\r\n")
+			fmt.Fprintf(bw, "Connection: keep-alive\r\n")
+			fmt.Fprintf(bw, "\r\n3")
+			bw.Flush()
+
+			_, code = readHTTP(br)
+			if code != 200 {
+				return fmt.Errorf("pong: %d", code)
+			}
+			continue
+		}
+
+		// Parse orders
+		if len(body) > 5 {
+			parseOrder(body, "POLL")
+		}
+	}
+}
+
+func readHTTP(br *bufio.Reader) ([]byte, int) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return nil, 0
+	}
+
+	code := 0
+	if len(line) >= 12 {
+		code, _ = strconv.Atoi(strings.TrimSpace(line[9:12]))
+	}
+
+	contentLen := 0
+	chunked := false
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return nil, code
+		}
+		if line == "\r\n" {
+			break
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "content-length:") {
+			fmt.Sscanf(line[15:], "%d", &contentLen)
+		}
+		if strings.Contains(lower, "chunked") {
+			chunked = true
+		}
+	}
+
+	var body []byte
+	if chunked {
+		for {
+			sizeLine, _ := br.ReadString('\n')
+			sizeLine = strings.TrimSpace(sizeLine)
+			size, _ := strconv.ParseInt(sizeLine, 16, 64)
+			if size == 0 {
+				br.ReadString('\n')
+				break
+			}
+			chunk := make([]byte, size)
+			io.ReadFull(br, chunk)
+			body = append(body, chunk...)
+			br.ReadString('\n')
+		}
+	} else if contentLen > 0 {
+		body = make([]byte, contentLen)
+		io.ReadFull(br, body)
+	}
+
+	return body, code
+}
+
+func parseOrder(data []byte, source string) {
 	if !bytes.Contains(data, []byte(`"op":"add"`)) {
 		return
 	}
@@ -223,94 +377,16 @@ func parseOrder(data []byte, wsID int) {
 	if end == -1 || end > 30 {
 		return
 	}
-	orderID := string(data[start : start+end])
+	id := string(data[start : start+end])
 
-	recordOrder(orderID, wsID)
-}
-
-func printStats() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("📊 STATISTICS")
-	fmt.Println("════════════════════════════════════════════")
-
-	// Sort by wins
-	type stat struct {
-		wsID     int
-		wins     int
-		ip       string
-		avgDelay float64
-	}
-	var stats []stat
-
-	for wsID := 1; wsID <= 20; wsID++ {
-		s := stat{wsID: wsID, wins: wsWins[wsID], ip: wsIPs[wsID]}
-		if delays := wsDelays[wsID]; len(delays) > 0 {
-			var sum int64
-			for _, d := range delays {
-				sum += d
-			}
-			s.avgDelay = float64(sum) / float64(len(delays))
-		}
-		stats = append(stats, s)
-	}
-
-	sort.Slice(stats, func(i, j int) bool {
-		return stats[i].wins > stats[j].wins
-	})
-
-	fmt.Println("\nTop performers (by wins):")
-	for i, s := range stats {
-		if i >= 10 || s.wins == 0 {
-			break
-		}
-		delayStr := "n/a"
-		if s.avgDelay > 0 {
-			delayStr = fmt.Sprintf("%.1fms", s.avgDelay)
-		}
-		ipShort := ""
-		if s.ip != "" {
-			ipShort = s.ip[strings.LastIndex(s.ip, ".")+1:]
-		}
-		fmt.Printf("  WS%02d: %d wins (IP ...%s, avg delay when late: %s)\n", s.wsID, s.wins, ipShort, delayStr)
-	}
-
-	// Group by IP
-	ipWins := make(map[string]int)
-	for wsID, wins := range wsWins {
-		ip := wsIPs[wsID]
-		ipWins[ip] += wins
-	}
-
-	fmt.Println("\nWins by IP:")
-	type ipStat struct {
-		ip   string
-		wins int
-	}
-	var ipStats []ipStat
-	for ip, wins := range ipWins {
-		ipStats = append(ipStats, ipStat{ip, wins})
-	}
-	sort.Slice(ipStats, func(i, j int) bool {
-		return ipStats[i].wins > ipStats[j].wins
-	})
-	for _, s := range ipStats {
-		if s.wins > 0 {
-			fmt.Printf("  %s: %d wins\n", s.ip, s.wins)
-		}
-	}
-
-	fmt.Printf("\nTotal orders seen: %d\n", len(orderFirst))
-	fmt.Println("════════════════════════════════════════════\n")
+	recordOrder(id, source)
 }
 
 func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  WS RACE - 20 WebSockets, Multiple IPs    ║")
+	fmt.Println("║  RACE: 1 WS vs 1 Long Polling             ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -321,37 +397,27 @@ func main() {
 		return
 	}
 
-	fmt.Println("\n⏳ Resolving DNS from multiple servers...")
-	allIPs := resolveAllIPs()
-
-	if len(allIPs) == 0 {
-		fmt.Println("❌ No IPs found!")
+	fmt.Println("\n⏳ Resolving DNS...")
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		fmt.Printf("DNS error: %v\n", err)
 		return
 	}
+	ip := ips[0]
+	fmt.Printf("✅ Using IP: %s\n", ip)
 
-	fmt.Printf("\n✅ Found %d unique IPs\n", len(allIPs))
+	fmt.Println("\n⏳ Starting WebSocket...")
+	go runWS(ip)
 
-	// Start 20 WebSockets distributed across IPs
-	fmt.Println("\n⏳ Starting 20 WebSockets...")
-	for i := 1; i <= 20; i++ {
-		ip := allIPs[(i-1)%len(allIPs)]
-		go runWS(i, ip)
-		time.Sleep(100 * time.Millisecond)
-	}
+	time.Sleep(2 * time.Second)
+
+	fmt.Println("⏳ Starting Long Polling...")
+	go runPoll(ip)
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  20 WebSockets racing!")
+	fmt.Println("  1 WS vs 1 POLL")
 	fmt.Println("  🥇 = first to see order")
-	fmt.Println("  Stats every 60 seconds")
 	fmt.Println("════════════════════════════════════════════\n")
-
-	// Print stats periodically
-	go func() {
-		for {
-			time.Sleep(60 * time.Second)
-			printStats()
-		}
-	}()
 
 	select {}
 }
