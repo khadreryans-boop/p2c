@@ -31,8 +31,8 @@ const (
 	pauseSeconds   = 20
 )
 
-const numClients = 20
-const numWebSockets = 5
+const numClients = 10
+const numWebSockets = 10
 
 var (
 	pauseTaking atomic.Bool
@@ -422,12 +422,12 @@ func speculativeParse(msg []byte, wsTime time.Time, wsID int, minCents int64) {
 		existingEv := existing.(*orderEvent)
 		delay := wsTime.Sub(existingEv.wsTime)
 		if delay > time.Millisecond {
-			fmt.Printf("   [WS%d] +%v (WS%d was first)\n", wsID, delay.Round(100*time.Microsecond), existingEv.wsID)
+			fmt.Printf("   [WS%02d] +%v (WS%02d first)\n", wsID, delay.Round(100*time.Microsecond), existingEv.wsID)
 		}
 		return
 	}
 
-	fmt.Printf("📥 [WS%d] NEW: %s amt=%s\n", wsID, id, amtStr)
+	fmt.Printf("📥 [WS%02d] NEW: %s amt=%s\n", wsID, id, amtStr)
 	ultraFastTake(ev)
 
 	go func() {
@@ -524,13 +524,13 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 	for {
 		conn, err := connectWebSocket(cookie)
 		if err != nil {
-			fmt.Printf("[WS%d] Connect error: %v\n", wsID, err)
+			fmt.Printf("[WS%02d] Connect error: %v\n", wsID, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
 		wsc := &wsConn{conn: conn}
-		fmt.Printf("[WS%d] 🔌 Connected\n", wsID)
+		fmt.Printf("[WS%02d] 🔌 Connected\n", wsID)
 
 		// Engine.IO OPEN
 		payload, op, err := readFrame(conn)
@@ -541,7 +541,7 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 
 		if op == ws.OpClose {
 			code, reason := parseCloseReason(payload)
-			fmt.Printf("[WS%d] ❌ Closed: %d %s\n", wsID, code, reason)
+			fmt.Printf("[WS%02d] ❌ Closed: %d %s\n", wsID, code, reason)
 			conn.Close()
 			time.Sleep(5 * time.Second)
 			continue
@@ -562,7 +562,7 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 		time.Sleep(50 * time.Millisecond)
 		wsc.writeText([]byte(`42["list:snapshot",[]]`))
 
-		fmt.Printf("[WS%d] 🚀 Active\n", wsID)
+		fmt.Printf("[WS%02d] 🚀 Active\n", wsID)
 
 		// Main loop
 		for {
@@ -570,7 +570,7 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 			wsTime := time.Now()
 
 			if err != nil {
-				fmt.Printf("[WS%d] Read error: %v\n", wsID, err)
+				fmt.Printf("[WS%02d] Read error: %v\n", wsID, err)
 				break
 			}
 
@@ -603,7 +603,7 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 
 	reconnect:
 		conn.Close()
-		fmt.Printf("[WS%d] 🔄 Reconnecting...\n", wsID)
+		fmt.Printf("[WS%02d] 🔄 Reconnecting...\n", wsID)
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -614,7 +614,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║     P2C SNIPER - 5 WebSocket Edition      ║")
+	fmt.Println("║    P2C SNIPER - 10 WS + 10 HTTP           ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -660,7 +660,7 @@ func main() {
 
 	// Warmup goroutine
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 		idx := 0
 		for range ticker.C {
@@ -672,7 +672,7 @@ func main() {
 				continue
 			}
 
-			if time.Since(c.lastUsed) > 10*time.Second {
+			if time.Since(c.lastUsed) > 8*time.Second {
 				if err := c.warmup(); err != nil {
 					c.ready.Store(false)
 					go c.connect()
@@ -688,7 +688,7 @@ func main() {
 	for i := 1; i <= numWebSockets; i++ {
 		wsWg.Add(1)
 		go runWebSocket(i, accessCookie, minCents, &wsWg)
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	fmt.Println()
