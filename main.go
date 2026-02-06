@@ -62,6 +62,7 @@ type httpClient struct {
 	ewmaUs   atomic.Uint64
 	name     string
 	lastUsed time.Time
+	inUse    atomic.Bool
 }
 
 var (
@@ -87,7 +88,7 @@ func (c *httpClient) connect() error {
 
 	dialer := &net.Dialer{
 		Timeout:   3 * time.Second,
-		KeepAlive: 30 * time.Second,
+		KeepAlive: 15 * time.Second,
 	}
 
 	tlsConfig := &tls.Config{
@@ -103,6 +104,8 @@ func (c *httpClient) connect() error {
 
 	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
 	}
 
 	c.conn = conn
@@ -121,7 +124,7 @@ func (c *httpClient) warmup() error {
 		return fmt.Errorf("no connection")
 	}
 
-	_ = c.conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	req := fmt.Sprintf("HEAD /p2c/orders HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
@@ -165,7 +168,7 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 		return 0, 0, fmt.Errorf("no connection")
 	}
 
-	_ = c.conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	req := fmt.Sprintf("POST %s%s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
@@ -242,6 +245,24 @@ func pickBestClient() *httpClient {
 	var best *httpClient
 	bestUs := uint64(1 << 62)
 
+	// First pass: find ready and not in use
+	for i := 0; i < numClients; i++ {
+		c := clients[i]
+		if !c.ready.Load() || c.inUse.Load() {
+			continue
+		}
+		us := c.ewmaUs.Load()
+		if us < bestUs {
+			bestUs = us
+			best = c
+		}
+	}
+
+	if best != nil {
+		return best
+	}
+
+	// Second pass: any ready client
 	for i := 0; i < numClients; i++ {
 		c := clients[i]
 		if !c.ready.Load() {
@@ -281,27 +302,16 @@ func ultraFastTake(ev *orderEvent) {
 		return
 	}
 
+	client.inUse.Store(true)
 	client.ready.Store(false)
 	code, dur, err := client.doTake(ev.id)
+	client.ready.Store(true)
+	client.inUse.Store(false)
 
 	if err != nil {
-		fmt.Printf("   ❌ [WS%d] %s ERROR: %v\n", ev.wsID, client.name, err)
+		fmt.Printf("   ❌ [WS%02d] %s ERR: %v\n", ev.wsID, client.name, err)
 		go client.connect()
-
-		client2 := pickBestClient()
-		if client2 != nil {
-			client2.ready.Store(false)
-			code, dur, err = client2.doTake(ev.id)
-			client2.ready.Store(true)
-			if err != nil {
-				return
-			}
-			client = client2
-		} else {
-			return
-		}
-	} else {
-		client.ready.Store(true)
+		return
 	}
 
 	us := uint64(dur.Microseconds())
@@ -312,7 +322,7 @@ func ultraFastTake(ev *orderEvent) {
 	e2eMs := time.Since(ev.wsTime).Milliseconds()
 
 	if code == 200 {
-		fmt.Printf("✅ TAKEN [WS%d] %s rtt=%dms e2e=%dms id=%s amt=%s\n",
+		fmt.Printf("✅ TAKEN [WS%02d] %s rtt=%dms e2e=%dms id=%s amt=%s\n",
 			ev.wsID, client.name, rttMs, e2eMs, ev.id, ev.amtStr)
 
 		pauseTaking.Store(true)
@@ -325,12 +335,12 @@ func ultraFastTake(ev *orderEvent) {
 	}
 
 	if code == 400 || code == 404 || code == 409 {
-		fmt.Printf("   LATE [WS%d] %s HTTP=%d rtt=%dms e2e=%dms\n",
+		fmt.Printf("   LATE [WS%02d] %s HTTP=%d rtt=%dms e2e=%dms\n",
 			ev.wsID, client.name, code, rttMs, e2eMs)
 		return
 	}
 
-	fmt.Printf("   ERR [WS%d] %s HTTP=%d rtt=%dms\n", ev.wsID, client.name, code, rttMs)
+	fmt.Printf("   ERR [WS%02d] %s HTTP=%d rtt=%dms\n", ev.wsID, client.name, code, rttMs)
 }
 
 // ============ Speculative Parser ============
@@ -473,7 +483,7 @@ func connectWebSocket(cookie string) (net.Conn, error) {
 			if tc, ok := conn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
 				_ = tc.SetKeepAlive(true)
-				_ = tc.SetKeepAlivePeriod(30 * time.Second)
+				_ = tc.SetKeepAlivePeriod(15 * time.Second)
 			}
 			return conn, nil
 		},
@@ -614,7 +624,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║    P2C SNIPER - 10 WS + 10 HTTP           ║")
+	fmt.Println("║    P2C SNIPER - Aggressive Warmup         ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -647,7 +657,7 @@ func main() {
 		if err := clients[i].connect(); err == nil {
 			clients[i].warmup()
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
 
 	ready := 0
@@ -658,25 +668,25 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d HTTP clients ready\n", ready, numClients)
 
-	// Warmup goroutine
+	// AGGRESSIVE warmup - each client every 2 seconds
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		idx := 0
-		for range ticker.C {
-			c := clients[idx%numClients]
-			idx++
-
-			if !c.ready.Load() {
-				go c.connect()
-				continue
-			}
-
-			if time.Since(c.lastUsed) > 8*time.Second {
-				if err := c.warmup(); err != nil {
-					c.ready.Store(false)
-					go c.connect()
+		for {
+			for i := 0; i < numClients; i++ {
+				c := clients[i]
+				if c.inUse.Load() {
+					continue
 				}
+				if !c.ready.Load() {
+					go c.connect()
+					continue
+				}
+				if time.Since(c.lastUsed) > 2*time.Second {
+					if err := c.warmup(); err != nil {
+						c.ready.Store(false)
+						go c.connect()
+					}
+				}
+				time.Sleep(200 * time.Millisecond)
 			}
 		}
 	}()
@@ -688,7 +698,7 @@ func main() {
 	for i := 1; i <= numWebSockets; i++ {
 		wsWg.Add(1)
 		go runWebSocket(i, accessCookie, minCents, &wsWg)
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 	}
 
 	fmt.Println()
