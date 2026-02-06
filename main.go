@@ -2,8 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -18,14 +18,13 @@ import (
 
 const (
 	host           = "app.send.tg"
-	paymentsPath   = "/internal/v1/p2c/payments"
+	pollPath       = "/internal/v1/p2c-socket/?EIO=4&transport=polling"
 	takePathPrefix = "/internal/v1/p2c/payments/take/"
 	pauseSeconds   = 20
-	pollInterval   = 50 * time.Millisecond
 )
 
 const (
-	numPollers    = 3
+	numPollers    = 10 // 10 Engine.IO polling clients
 	numTakers     = 10
 	parallelTakes = 5
 )
@@ -39,6 +38,7 @@ var (
 	cookie    string
 	reqPrefix []byte
 	reqSuffix []byte
+	popIPs    []string
 )
 
 // ============ HTTP Client ============
@@ -51,6 +51,7 @@ type httpClient struct {
 	ready    atomic.Bool
 	name     string
 	ip       string
+	sid      string // Engine.IO session ID
 	lastUsed time.Time
 	inUse    atomic.Bool
 	lastRtt  atomic.Uint64
@@ -61,7 +62,6 @@ type httpClient struct {
 
 var takers []*httpClient
 var pollers []*httpClient
-var popIPs []string
 
 func newHTTPClient(name, ip string) *httpClient {
 	c := &httpClient{name: name, ip: ip}
@@ -113,56 +113,152 @@ func (c *httpClient) connect() error {
 	return nil
 }
 
-func (c *httpClient) pollPaymentsRaw() ([]byte, time.Duration, error) {
+// Engine.IO handshake - get session ID
+func (c *httpClient) engineIOHandshake() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conn == nil {
-		return nil, 0, fmt.Errorf("no conn")
+		return fmt.Errorf("no conn")
 	}
 
-	c.conn.SetDeadline(time.Now().Add(2 * time.Second))
+	c.conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	req := "GET " + paymentsPath + " HTTP/1.1\r\n" +
+	req := "GET " + pollPath + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
 		"Cookie: " + cookie + "\r\n" +
-		"Accept: application/json\r\n" +
+		"Accept: */*\r\n" +
 		"Connection: keep-alive\r\n" +
 		"\r\n"
+
+	_, err := c.bw.WriteString(req)
+	if err != nil {
+		return err
+	}
+	if err := c.bw.Flush(); err != nil {
+		return err
+	}
+
+	// Read response
+	body, err := c.readResponse()
+	if err != nil {
+		return err
+	}
+
+	// Parse Engine.IO OPEN packet: 0{"sid":"xxx","upgrades":["websocket"],"pingInterval":25000,"pingTimeout":20000}
+	if len(body) < 2 || body[0] != '0' {
+		return fmt.Errorf("invalid handshake: %s", string(body[:min(50, len(body))]))
+	}
+
+	// Extract sid
+	sidIdx := bytes.Index(body, []byte(`"sid":"`))
+	if sidIdx == -1 {
+		return fmt.Errorf("no sid in response")
+	}
+	sidStart := sidIdx + 7
+	sidEnd := bytes.IndexByte(body[sidStart:], '"')
+	if sidEnd == -1 {
+		return fmt.Errorf("invalid sid")
+	}
+	c.sid = string(body[sidStart : sidStart+sidEnd])
+
+	fmt.Printf("   [%s] Engine.IO sid=%s\n", c.name, c.sid[:12]+"...")
+	return nil
+}
+
+// Send Engine.IO message via polling
+func (c *httpClient) engineIOSend(msg string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil || c.sid == "" {
+		return fmt.Errorf("not connected")
+	}
+
+	c.conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	body := msg
+	req := fmt.Sprintf("POST %s&sid=%s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Cookie: %s\r\n"+
+		"Content-Type: text/plain;charset=UTF-8\r\n"+
+		"Content-Length: %d\r\n"+
+		"Connection: keep-alive\r\n"+
+		"\r\n%s",
+		pollPath, c.sid, host, cookie, len(body), body)
+
+	_, err := c.bw.WriteString(req)
+	if err != nil {
+		return err
+	}
+	if err := c.bw.Flush(); err != nil {
+		return err
+	}
+
+	_, err = c.readResponse()
+	return err
+}
+
+// Long-poll for messages
+func (c *httpClient) engineIOPoll() ([]byte, time.Duration, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil || c.sid == "" {
+		return nil, 0, fmt.Errorf("not connected")
+	}
+
+	c.conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	req := fmt.Sprintf("GET %s&sid=%s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Cookie: %s\r\n"+
+		"Accept: */*\r\n"+
+		"Connection: keep-alive\r\n"+
+		"\r\n",
+		pollPath, c.sid, host, cookie)
 
 	start := time.Now()
 	_, err := c.bw.WriteString(req)
 	if err != nil {
-		c.conn.Close()
-		c.conn = nil
 		c.ready.Store(false)
 		return nil, 0, err
 	}
 	if err := c.bw.Flush(); err != nil {
-		c.conn.Close()
-		c.conn = nil
 		c.ready.Store(false)
 		return nil, 0, err
 	}
 
+	body, err := c.readResponse()
+	dur := time.Since(start)
+
+	if err != nil {
+		c.ready.Store(false)
+		return nil, dur, err
+	}
+
+	c.lastRtt.Store(uint64(dur.Milliseconds()))
+	return body, dur, nil
+}
+
+func (c *httpClient) readResponse() ([]byte, error) {
+	// Read status line
 	line, err := c.br.ReadString('\n')
 	if err != nil {
-		c.conn.Close()
-		c.conn = nil
-		c.ready.Store(false)
-		return nil, 0, err
+		return nil, err
 	}
 
 	if len(line) < 12 {
-		return nil, 0, fmt.Errorf("short status: %s", line)
+		return nil, fmt.Errorf("short status")
 	}
 
+	// Read headers
 	contentLen := 0
 	chunked := false
 	for {
 		line, err := c.br.ReadString('\n')
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		if line == "\r\n" {
 			break
@@ -171,52 +267,36 @@ func (c *httpClient) pollPaymentsRaw() ([]byte, time.Duration, error) {
 		if strings.HasPrefix(lower, "content-length:") {
 			fmt.Sscanf(line[15:], "%d", &contentLen)
 		}
-		if strings.Contains(lower, "transfer-encoding") && strings.Contains(lower, "chunked") {
+		if strings.Contains(lower, "chunked") {
 			chunked = true
 		}
 	}
 
+	// Read body
 	var body []byte
 	if chunked {
-		// Read chunked encoding
 		for {
 			sizeLine, err := c.br.ReadString('\n')
 			if err != nil {
-				return nil, 0, err
+				return nil, err
 			}
 			sizeLine = strings.TrimSpace(sizeLine)
-			size, err := strconv.ParseInt(sizeLine, 16, 64)
-			if err != nil {
-				return nil, 0, fmt.Errorf("bad chunk size: %s", sizeLine)
-			}
+			size, _ := strconv.ParseInt(sizeLine, 16, 64)
 			if size == 0 {
-				c.br.ReadString('\n') // trailing CRLF
+				c.br.ReadString('\n')
 				break
 			}
 			chunk := make([]byte, size)
-			_, err = io.ReadFull(c.br, chunk)
-			if err != nil {
-				return nil, 0, err
-			}
+			io.ReadFull(c.br, chunk)
 			body = append(body, chunk...)
-			c.br.ReadString('\n') // CRLF after chunk
+			c.br.ReadString('\n')
 		}
 	} else if contentLen > 0 {
 		body = make([]byte, contentLen)
 		_, err = io.ReadFull(c.br, body)
-		if err != nil {
-			c.conn.Close()
-			c.conn = nil
-			c.ready.Store(false)
-			return nil, 0, err
-		}
 	}
 
-	dur := time.Since(start)
-	c.lastUsed = time.Now()
-	c.lastRtt.Store(uint64(dur.Milliseconds()))
-
-	return body, dur, nil
+	return body, err
 }
 
 func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
@@ -252,13 +332,11 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	}
 
 	if len(line) < 12 {
-		c.conn.Close()
-		c.conn = nil
-		c.ready.Store(false)
 		return 0, dur, fmt.Errorf("short")
 	}
 	code, _ := strconv.Atoi(line[9:12])
 
+	// Drain response
 	contentLen := 0
 	for {
 		line, err := c.br.ReadString('\n')
@@ -316,7 +394,7 @@ type takeResult struct {
 	err    error
 }
 
-func instantTake(id, amt string, detectTime time.Time) {
+func instantTake(id, amt string, pollerID int, detectTime time.Time) {
 	if pauseTaking.Load() {
 		return
 	}
@@ -331,7 +409,7 @@ func instantTake(id, amt string, detectTime time.Time) {
 		return
 	}
 
-	fmt.Printf("📥 NEW: %s amt=%s (%d takers)\n", id, amt, len(best))
+	fmt.Printf("📥 [P%d] NEW: %s amt=%s\n", pollerID, id, amt)
 
 	results := make(chan takeResult, len(best))
 	var wg sync.WaitGroup
@@ -406,169 +484,183 @@ func instantTake(id, amt string, detectTime time.Time) {
 	}()
 }
 
-// Global known IDs
-var globalKnownIDs sync.Map
+// ============ Parse Engine.IO messages ============
+
+var (
+	opAddBytes = []byte(`"op":"add"`)
+	idPrefix   = []byte(`"id":"`)
+	amtPrefix  = []byte(`"in_amount":"`)
+)
+
+func parseMessages(data []byte, pollerID int, detectTime time.Time, minCents int64) {
+	// Engine.IO polling can return multiple messages concatenated
+	// Format: <length>:<packet><length>:<packet>...
+	// Or just single packet for short messages
+
+	// Check for "list:update" with "add"
+	if !bytes.Contains(data, opAddBytes) {
+		return
+	}
+
+	// Find all "add" operations
+	idx := 0
+	for {
+		addIdx := bytes.Index(data[idx:], opAddBytes)
+		if addIdx == -1 {
+			break
+		}
+		addIdx += idx
+
+		// Find ID near this add
+		searchStart := addIdx
+		if searchStart > 200 {
+			searchStart = addIdx - 200
+		}
+		searchEnd := addIdx + 500
+		if searchEnd > len(data) {
+			searchEnd = len(data)
+		}
+		chunk := data[searchStart:searchEnd]
+
+		idIdx := bytes.Index(chunk, idPrefix)
+		if idIdx == -1 {
+			idx = addIdx + 10
+			continue
+		}
+		idStart := idIdx + 6
+		idEnd := bytes.IndexByte(chunk[idStart:], '"')
+		if idEnd == -1 || idEnd > 30 {
+			idx = addIdx + 10
+			continue
+		}
+		id := string(chunk[idStart : idStart+idEnd])
+
+		// Get amount
+		var amt string
+		amtIdx := bytes.Index(chunk, amtPrefix)
+		if amtIdx != -1 {
+			amtStart := amtIdx + 13
+			amtEnd := bytes.IndexByte(chunk[amtStart:], '"')
+			if amtEnd != -1 && amtEnd < 20 {
+				amt = string(chunk[amtStart : amtStart+amtEnd])
+			}
+		}
+
+		// Filter
+		if minCents > 0 && amt != "" {
+			var whole, frac int64
+			var fracDigits int
+			var seenDot bool
+			for i := 0; i < len(amt); i++ {
+				c := amt[i]
+				if c == '.' {
+					seenDot = true
+					continue
+				}
+				if c >= '0' && c <= '9' {
+					d := int64(c - '0')
+					if !seenDot {
+						whole = whole*10 + d
+					} else if fracDigits < 2 {
+						frac = frac*10 + d
+						fracDigits++
+					}
+				}
+			}
+			if fracDigits == 1 {
+				frac *= 10
+			}
+			if whole*100+frac < minCents {
+				idx = addIdx + 10
+				continue
+			}
+		}
+
+		go instantTake(id, amt, pollerID, detectTime)
+		idx = addIdx + 10
+	}
+}
 
 // ============ Polling Loop ============
 
 func runPoller(pollerID int, client *httpClient, minCents int64) {
-	var pollCount uint64
-	var firstRun = true
-
 	for {
-		if pauseTaking.Load() {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
+		// Connect
 		if !client.ready.Load() {
-			client.connect()
-			time.Sleep(100 * time.Millisecond)
+			if err := client.connect(); err != nil {
+				fmt.Printf("   [P%d] connect error: %v\n", pollerID, err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+		}
+
+		// Engine.IO handshake
+		if err := client.engineIOHandshake(); err != nil {
+			fmt.Printf("   [P%d] handshake error: %v\n", pollerID, err)
+			client.ready.Store(false)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		body, dur, err := client.pollPaymentsRaw()
-		detectTime := time.Now()
-		pollCount++
-
-		if err != nil {
-			fmt.Printf("   [P%d] ERROR: %v\n", pollerID, err)
+		// Send Socket.IO connect
+		if err := client.engineIOSend("40"); err != nil {
+			fmt.Printf("   [P%d] send 40 error: %v\n", pollerID, err)
 			client.ready.Store(false)
 			continue
 		}
 
-		// First run - print raw JSON sample
-		if firstRun && pollerID == 1 {
-			firstRun = false
-			fmt.Println("\n════════ RAW JSON SAMPLE ════════")
-			if len(body) > 500 {
-				fmt.Println(string(body[:500]) + "...")
-			} else {
-				fmt.Println(string(body))
-			}
-			fmt.Println("════════════════════════════════════\n")
-		}
-
-		// Parse JSON - try to be flexible
-		var rawData map[string]interface{}
-		if err := json.Unmarshal(body, &rawData); err != nil {
-			fmt.Printf("   [P%d] JSON parse error: %v\n", pollerID, err)
+		// Poll for connect ACK
+		data, _, err := client.engineIOPoll()
+		if err != nil {
+			fmt.Printf("   [P%d] poll error: %v\n", pollerID, err)
+			client.ready.Store(false)
 			continue
 		}
+		_ = data
 
-		// Find the array with payments
-		var payments []map[string]interface{}
+		// Initialize list
+		time.Sleep(50 * time.Millisecond)
+		client.engineIOSend(`42["list:initialize"]`)
+		time.Sleep(50 * time.Millisecond)
+		client.engineIOSend(`42["list:snapshot",[]]`)
 
-		if data, ok := rawData["data"].([]interface{}); ok {
-			for _, item := range data {
-				if m, ok := item.(map[string]interface{}); ok {
-					payments = append(payments, m)
-				}
-			}
-		}
+		fmt.Printf("[P%d] 🚀 Connected via HTTP polling\n", pollerID)
 
-		// Debug: show what we found
-		if pollCount%100 == 1 && pollerID == 1 {
-			fmt.Printf("   [P%d] poll=%dms found=%d payments\n", pollerID, dur.Milliseconds(), len(payments))
-			if len(payments) > 0 {
-				// Show first payment structure
-				fmt.Printf("   Sample payment keys: ")
-				for k := range payments[0] {
-					fmt.Printf("%s ", k)
-				}
-				fmt.Println()
-			}
-		}
-
-		for _, p := range payments {
-			// Get ID - try different field names
-			var id string
-			if v, ok := p["id"].(string); ok {
-				id = v
-			} else if v, ok := p["_id"].(string); ok {
-				id = v
-			} else if v, ok := p["payment_id"].(string); ok {
-				id = v
-			}
-
-			if id == "" {
+		// Continuous polling
+		for {
+			if pauseTaking.Load() {
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
-			// Check if already known
-			if _, exists := globalKnownIDs.Load(id); exists {
+			data, dur, err := client.engineIOPoll()
+			detectTime := time.Now()
+
+			if err != nil {
+				fmt.Printf("   [P%d] poll error: %v\n", pollerID, err)
+				client.ready.Store(false)
+				break
+			}
+
+			// Handle ping (2) - respond with pong (3)
+			if len(data) == 1 && data[0] == '2' {
+				client.engineIOSend("3")
 				continue
 			}
-			globalKnownIDs.Store(id, time.Now())
 
-			// Get amount - try different field names
-			var amt string
-			if v, ok := p["in_amount"].(string); ok {
-				amt = v
-			} else if v, ok := p["amount"].(string); ok {
-				amt = v
-			} else if v, ok := p["in_amount"].(float64); ok {
-				amt = fmt.Sprintf("%.2f", v)
-			} else if v, ok := p["amount"].(float64); ok {
-				amt = fmt.Sprintf("%.2f", v)
+			// Parse messages for new orders
+			if len(data) > 5 {
+				parseMessages(data, pollerID, detectTime, minCents)
 			}
 
-			// Get status
-			var status string
-			if v, ok := p["status"].(string); ok {
-				status = v
+			// Log occasionally
+			if dur.Milliseconds() > 1000 {
+				fmt.Printf("   [P%d] poll took %dms\n", pollerID, dur.Milliseconds())
 			}
-
-			// Log every new payment we see
-			fmt.Printf("🔍 [P%d] NEW ID: %s amt=%s status=%s\n", pollerID, id, amt, status)
-
-			// Filter by amount
-			if minCents > 0 && amt != "" {
-				var whole, frac int64
-				var fracDigits int
-				var seenDot bool
-				for i := 0; i < len(amt); i++ {
-					c := amt[i]
-					if c == '.' {
-						seenDot = true
-						continue
-					}
-					if c >= '0' && c <= '9' {
-						d := int64(c - '0')
-						if !seenDot {
-							whole = whole*10 + d
-						} else if fracDigits < 2 {
-							frac = frac*10 + d
-							fracDigits++
-						}
-					}
-				}
-				if fracDigits == 1 {
-					frac *= 10
-				}
-				if whole*100+frac < minCents {
-					fmt.Printf("   [P%d] SKIP amt=%s < min\n", pollerID, amt)
-					continue
-				}
-			}
-
-			go instantTake(id, amt, detectTime)
 		}
 
-		// Cleanup old IDs
-		if pollCount%500 == 0 {
-			now := time.Now()
-			globalKnownIDs.Range(func(key, value interface{}) bool {
-				if t, ok := value.(time.Time); ok {
-					if now.Sub(t) > 5*time.Minute {
-						globalKnownIDs.Delete(key)
-					}
-				}
-				return true
-			})
-		}
-
-		time.Sleep(pollInterval)
+		fmt.Printf("[P%d] 🔄 Reconnecting...\n", pollerID)
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -576,7 +668,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - HTTP Polling (DEBUG v2)     ║")
+	fmt.Println("║  P2C SNIPER - Engine.IO HTTP Polling      ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -613,6 +705,7 @@ func main() {
 		"Content-Length: 2\r\n" +
 		"\r\n{}")
 
+	// Create takers
 	fmt.Printf("\n⏳ Creating %d takers...\n", numTakers)
 	for i := 0; i < numTakers; i++ {
 		ip := popIPs[i%len(popIPs)]
@@ -622,27 +715,14 @@ func main() {
 		takers = append(takers, c)
 	}
 
-	fmt.Printf("⏳ Creating %d pollers...\n", numPollers)
+	// Create pollers
+	fmt.Printf("⏳ Creating %d Engine.IO pollers...\n", numPollers)
 	for i := 0; i < numPollers; i++ {
 		ip := popIPs[i%len(popIPs)]
 		name := fmt.Sprintf("P%d@%s", i+1, ip[strings.LastIndex(ip, ".")+1:])
 		c := newHTTPClient(name, ip)
-		c.connect()
 		pollers = append(pollers, c)
 	}
-
-	ready := 0
-	for _, c := range takers {
-		if c.ready.Load() {
-			ready++
-		}
-	}
-	for _, c := range pollers {
-		if c.ready.Load() {
-			ready++
-		}
-	}
-	fmt.Printf("✅ %d/%d connections ready\n", ready, numTakers+numPollers)
 
 	// Warmup takers
 	for i, c := range takers {
@@ -676,15 +756,16 @@ func main() {
 		}(i, c)
 	}
 
-	fmt.Printf("\n⏳ Starting %d pollers (every %v)...\n", numPollers, pollInterval)
+	// Start pollers
+	fmt.Printf("\n⏳ Starting %d Engine.IO pollers...\n", numPollers)
 	for i, c := range pollers {
 		go runPoller(i+1, c, minCents)
-		time.Sleep(pollInterval / time.Duration(numPollers))
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  HTTP POLLING every %v\n", pollInterval)
-	fmt.Printf("  Watch for 🔍 NEW ID messages!\n")
+	fmt.Println("  Engine.IO HTTP POLLING (not WebSocket!)")
+	fmt.Printf("  %d pollers | %d takers\n", numPollers, numTakers)
 	fmt.Println("════════════════════════════════════════════\n")
 
 	select {}
