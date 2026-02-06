@@ -141,9 +141,12 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 	}
 
 	if len(line) < 12 {
-		return 0, dur, fmt.Errorf("short")
+		return 0, dur, fmt.Errorf("short: %q", line)
 	}
 	code, _ := strconv.Atoi(line[9:12])
+	if code == 0 {
+		fmt.Printf("DEBUG response: %q\n", line[:min(len(line), 50)])
+	}
 
 	// Drain
 	for {
@@ -591,6 +594,13 @@ func main() {
 
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b
