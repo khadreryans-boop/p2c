@@ -28,9 +28,9 @@ const (
 	pauseSeconds   = 20
 )
 
-const numClients = 15
 const numWebSockets = 20
 const parallelTakes = 5
+const clientsPerIP = 3
 
 var (
 	pauseTaking atomic.Bool
@@ -41,6 +41,7 @@ var (
 	reqPrefix []byte
 	reqSuffix []byte
 	cookie    string
+	popIPs    []string
 )
 
 // ============ HTTP Client Pool ============
@@ -52,6 +53,7 @@ type httpClient struct {
 	mu       sync.Mutex
 	ready    atomic.Bool
 	name     string
+	ip       string
 	lastUsed time.Time
 	inUse    atomic.Bool
 	lastRtt  atomic.Uint64
@@ -63,10 +65,10 @@ type httpClient struct {
 	wins          atomic.Uint64
 }
 
-var clients [numClients]*httpClient
+var clients []*httpClient
 
-func newHTTPClient(name string) *httpClient {
-	c := &httpClient{name: name}
+func newHTTPClient(name, ip string) *httpClient {
+	c := &httpClient{name: name, ip: ip}
 	c.ready.Store(false)
 	c.minLatency.Store(999999999)
 	c.lastRtt.Store(999999)
@@ -87,31 +89,37 @@ func (c *httpClient) connect() error {
 		KeepAlive: 10 * time.Second,
 	}
 
-	tlsConfig := &tls.Config{
-		ServerName: host,
-		MinVersion: tls.VersionTLS12,
-	}
-
-	conn, err := tls.DialWithDialer(dialer, "tcp", host+":443", tlsConfig)
+	// Connect to specific IP directly
+	conn, err := dialer.Dial("tcp", c.ip+":443")
 	if err != nil {
 		return err
 	}
 
-	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(10 * time.Second)
 	}
 
-	c.conn = conn
-	c.br = bufio.NewReaderSize(conn, 4096)
-	c.bw = bufio.NewWriterSize(conn, 2048)
+	// TLS with SNI = host
+	tlsConfig := &tls.Config{
+		ServerName: host,
+		MinVersion: tls.VersionTLS12,
+	}
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		conn.Close()
+		return err
+	}
+
+	c.conn = tlsConn
+	c.br = bufio.NewReaderSize(tlsConn, 4096)
+	c.bw = bufio.NewWriterSize(tlsConn, 2048)
 	c.lastUsed = time.Now()
 	c.ready.Store(true)
 	return nil
 }
 
-// HEAD warmup
 func (c *httpClient) warmup() (time.Duration, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -235,6 +243,7 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	return code, dur, nil
 }
 
+// Get best clients, prefer different IPs
 func getBestClients(count int) []*httpClient {
 	type cs struct {
 		c   *httpClient
@@ -242,8 +251,7 @@ func getBestClients(count int) []*httpClient {
 	}
 
 	var avail []cs
-	for i := 0; i < numClients; i++ {
-		c := clients[i]
+	for _, c := range clients {
 		if c.ready.Load() && !c.inUse.Load() {
 			avail = append(avail, cs{c, c.lastRtt.Load()})
 		}
@@ -253,10 +261,38 @@ func getBestClients(count int) []*httpClient {
 		return avail[i].rtt < avail[j].rtt
 	})
 
+	// Select best from different IPs
+	usedIPs := make(map[string]int)
 	var result []*httpClient
-	for i := 0; i < len(avail) && i < count; i++ {
-		result = append(result, avail[i].c)
+
+	for _, a := range avail {
+		if len(result) >= count {
+			break
+		}
+		// Prefer distributing across IPs
+		if usedIPs[a.c.ip] < 2 {
+			result = append(result, a.c)
+			usedIPs[a.c.ip]++
+		}
 	}
+
+	// Fill remaining if needed
+	for _, a := range avail {
+		if len(result) >= count {
+			break
+		}
+		found := false
+		for _, r := range result {
+			if r == a.c {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, a.c)
+		}
+	}
+
 	return result
 }
 
@@ -284,7 +320,12 @@ func instantTake(id, amt string, wsID int, wsTime time.Time) {
 		return
 	}
 
-	fmt.Printf("📥 [WS%02d] %s amt=%s (%d clients)\n", wsID, id, amt, len(best))
+	// Show which IPs we're using
+	ips := make(map[string]bool)
+	for _, c := range best {
+		ips[c.ip] = true
+	}
+	fmt.Printf("📥 [WS%02d] %s amt=%s (%d clients, %d IPs)\n", wsID, id, amt, len(best), len(ips))
 
 	results := make(chan takeResult, len(best))
 	var wg sync.WaitGroup
@@ -327,7 +368,9 @@ func instantTake(id, amt string, wsID int, wsTime time.Time) {
 			details = append(details, r.client.name+":ERR")
 			continue
 		}
-		s := fmt.Sprintf("%s:%d", r.client.name, r.dur.Milliseconds())
+		// Show IP in output
+		ipShort := r.client.ip[strings.LastIndex(r.client.ip, ".")+1:]
+		s := fmt.Sprintf("%s[%s]:%d", r.client.name, ipShort, r.dur.Milliseconds())
 		if r.code == 200 {
 			s += "✓"
 			if winner == nil {
@@ -439,7 +482,7 @@ func (w *wsConn) write(msg []byte) error {
 	return ws.WriteFrame(w.conn, frame)
 }
 
-func connectWS(cookie string) (net.Conn, error) {
+func connectWS(cookie string, ip string) (net.Conn, error) {
 	dialer := ws.Dialer{
 		Header: ws.HandshakeHeaderHTTP(http.Header{
 			"Cookie": []string{cookie},
@@ -447,8 +490,9 @@ func connectWS(cookie string) (net.Conn, error) {
 		}),
 		Timeout: 10 * time.Second,
 		NetDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Connect to specific IP
 			d := &net.Dialer{Timeout: 5 * time.Second}
-			conn, err := d.DialContext(ctx, network, addr)
+			conn, err := d.DialContext(ctx, network, ip+":443")
 			if err != nil {
 				return nil, err
 			}
@@ -484,19 +528,19 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
-func runWS(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
+func runWS(wsID int, cookie string, ip string, minCents int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for {
-		conn, err := connectWS(cookie)
+		conn, err := connectWS(cookie, ip)
 		if err != nil {
-			fmt.Printf("[WS%02d] err: %v\n", wsID, err)
+			fmt.Printf("[WS%02d@%s] err: %v\n", wsID, ip[strings.LastIndex(ip, ".")+1:], err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
 		wsc := &wsConn{conn: conn}
-		fmt.Printf("[WS%02d] 🔌\n", wsID)
+		fmt.Printf("[WS%02d@%s] 🔌\n", wsID, ip[strings.LastIndex(ip, ".")+1:])
 
 		p, op, err := readFrame(conn)
 		if err != nil || op == ws.OpClose {
@@ -517,7 +561,7 @@ func runWS(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 		time.Sleep(30 * time.Millisecond)
 		wsc.write([]byte(`42["list:snapshot",[]]`))
 
-		fmt.Printf("[WS%02d] 🚀\n", wsID)
+		fmt.Printf("[WS%02d@%s] 🚀\n", wsID, ip[strings.LastIndex(ip, ".")+1:])
 
 		for {
 			p, op, err := readFrame(conn)
@@ -552,7 +596,7 @@ func runWS(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 
 	reconn:
 		conn.Close()
-		fmt.Printf("[WS%02d] 🔄\n", wsID)
+		fmt.Printf("[WS%02d@%s] 🔄\n", wsID, ip[strings.LastIndex(ip, ".")+1:])
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -565,38 +609,40 @@ func parseCloseReason(p []byte) (uint16, string) {
 }
 
 func printStats() {
-	fmt.Println("\n📊 STATS:")
-	type s struct {
-		n    string
-		rtt  uint64
-		reqs uint64
-		avg  uint64
-		min  uint64
-		max  uint64
-		wins uint64
-	}
-	var stats []s
-	for i := 0; i < numClients; i++ {
-		c := clients[i]
-		minL := c.minLatency.Load()
-		if minL == 999999999 {
-			minL = 0
-		}
-		total := c.totalRequests.Load()
-		var avg uint64
-		if total > 0 {
-			avg = c.totalLatency.Load() / total
-		}
-		stats = append(stats, s{
-			c.name, c.lastRtt.Load(), total, avg, minL, c.maxLatency.Load(), c.wins.Load(),
-		})
-	}
-	sort.Slice(stats, func(i, j int) bool {
-		return stats[i].rtt < stats[j].rtt
+	fmt.Println("\n📊 STATS by IP:")
+
+	// Group by IP
+	ipStats := make(map[string]struct {
+		reqs, wins       uint64
+		totalLat, minLat uint64
 	})
-	for _, x := range stats {
-		fmt.Printf("  %s: rtt=%3d reqs=%d avg=%d min=%d max=%d wins=%d\n",
-			x.n, x.rtt, x.reqs, x.avg, x.min, x.max, x.wins)
+
+	for _, c := range clients {
+		s := ipStats[c.ip]
+		s.reqs += c.totalRequests.Load()
+		s.wins += c.wins.Load()
+		s.totalLat += c.totalLatency.Load()
+		min := c.minLatency.Load()
+		if min != 999999999 && (s.minLat == 0 || min < s.minLat) {
+			s.minLat = min
+		}
+		ipStats[c.ip] = s
+	}
+
+	for ip, s := range ipStats {
+		avg := uint64(0)
+		if s.reqs > 0 {
+			avg = s.totalLat / s.reqs
+		}
+		fmt.Printf("  %s: reqs=%d avg=%dms min=%dms wins=%d\n",
+			ip, s.reqs, avg, s.minLat, s.wins)
+	}
+
+	fmt.Println("\n  Per client:")
+	for _, c := range clients {
+		if c.totalRequests.Load() > 0 {
+			fmt.Printf("    %s: rtt=%d wins=%d\n", c.name, c.lastRtt.Load(), c.wins.Load())
+		}
 	}
 }
 
@@ -604,7 +650,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - 20 WS + HEAD warmup         ║")
+	fmt.Println("║  P2C SNIPER - Multi-POP Edition           ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -624,6 +670,20 @@ func main() {
 		minCents = int64(f * 100)
 	}
 
+	// Resolve DNS to get all POP IPs
+	fmt.Println("\n⏳ Resolving DNS...")
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		fmt.Printf("DNS error: %v\n", err)
+		return
+	}
+
+	popIPs = ips
+	fmt.Printf("✅ Found %d POP IPs:\n", len(popIPs))
+	for _, ip := range popIPs {
+		fmt.Printf("   • %s\n", ip)
+	}
+
 	// Build request template
 	reqPrefix = []byte("POST " + takePathPrefix)
 	reqSuffix = []byte(" HTTP/1.1\r\n" +
@@ -633,50 +693,58 @@ func main() {
 		"Content-Length: 2\r\n" +
 		"\r\n{}")
 
-	fmt.Printf("\n⏳ Connecting %d HTTP clients...\n", numClients)
+	// Create clients for EACH IP
+	fmt.Printf("\n⏳ Creating %d clients per IP...\n", clientsPerIP)
 
+	for _, ip := range popIPs {
+		for i := 0; i < clientsPerIP; i++ {
+			name := fmt.Sprintf("%s_%d", ip[strings.LastIndex(ip, ".")+1:], i+1)
+			c := newHTTPClient(name, ip)
+			clients = append(clients, c)
+		}
+	}
+
+	// Connect all
 	var connWg sync.WaitGroup
-	for i := 0; i < numClients; i++ {
-		clients[i] = newHTTPClient(fmt.Sprintf("C%02d", i+1))
+	for _, c := range clients {
 		connWg.Add(1)
-		go func(c *httpClient) {
+		go func(cl *httpClient) {
 			defer connWg.Done()
-			if c.connect() == nil {
-				c.warmup()
+			if cl.connect() == nil {
+				cl.warmup()
 			}
-		}(clients[i])
+		}(c)
 	}
 	connWg.Wait()
 
 	ready := 0
-	for i := 0; i < numClients; i++ {
-		if clients[i].ready.Load() {
+	for _, c := range clients {
+		if c.ready.Load() {
 			ready++
 		}
 	}
-	fmt.Printf("✅ %d/%d ready\n", ready, numClients)
+	fmt.Printf("✅ %d/%d clients ready\n", ready, len(clients))
 
-	// Warmup every 2 seconds (staggered)
-	for i := 0; i < numClients; i++ {
-		go func(idx int) {
-			c := clients[idx]
-			time.Sleep(time.Duration(idx*133) * time.Millisecond)
+	// Warmup every 2 seconds
+	for i, c := range clients {
+		go func(idx int, cl *httpClient) {
+			time.Sleep(time.Duration(idx*100) * time.Millisecond)
 			for {
 				time.Sleep(2 * time.Second)
-				if c.inUse.Load() {
+				if cl.inUse.Load() {
 					continue
 				}
-				if !c.ready.Load() {
-					c.connect()
+				if !cl.ready.Load() {
+					cl.connect()
 					continue
 				}
-				_, err := c.warmup()
+				_, err := cl.warmup()
 				if err != nil {
-					c.ready.Store(false)
-					c.connect()
+					cl.ready.Store(false)
+					cl.connect()
 				}
 			}
-		}(i)
+		}(i, c)
 	}
 
 	go func() {
@@ -686,17 +754,19 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("\n⏳ Starting %d WebSockets...\n", numWebSockets)
+	// Distribute WebSockets across POPs
+	fmt.Printf("\n⏳ Starting %d WebSockets across %d POPs...\n", numWebSockets, len(popIPs))
 
 	var wsWg sync.WaitGroup
 	for i := 1; i <= numWebSockets; i++ {
+		ip := popIPs[(i-1)%len(popIPs)]
 		wsWg.Add(1)
-		go runWS(i, cookie, minCents, &wsWg)
-		time.Sleep(100 * time.Millisecond)
+		go runWS(i, cookie, ip, minCents, &wsWg)
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  20 WebSockets | HEAD warmup every 2s")
+	fmt.Printf("  %d POPs | %d clients | %d WebSockets\n", len(popIPs), len(clients), numWebSockets)
 	fmt.Println("════════════════════════════════════════════\n")
 
 	wsWg.Wait()
