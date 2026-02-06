@@ -252,22 +252,25 @@ func doTake(id, amt string, wsID int, detectTime time.Time) {
 		parts = append(parts, s)
 	}
 
+	statsMu.Lock()
 	if won {
-		statsMu.Lock()
 		totalWon++
-		statsMu.Unlock()
-		fmt.Printf("✅ [WS%02d] e2e=%dms amt=%s | %s\n", wsID, e2e, amt, strings.Join(parts, " "))
+		fmt.Printf("\n🎉🎉🎉 УСПЕХ! 🎉🎉🎉\n")
+		fmt.Printf("✅ [WS%02d] e2e=%dms amt=%s\n", wsID, e2e, amt)
+		fmt.Printf("   %s\n\n", strings.Join(parts, " "))
+	} else {
+		totalLate++
+		fmt.Printf("   [WS%02d] LATE e2e=%dms amt=%s | %s\n", wsID, e2e, amt, strings.Join(parts, " "))
+	}
+	statsMu.Unlock()
+
+	if won {
 		pauseTaking.Store(true)
 		go func() {
 			time.Sleep(pauseSeconds * time.Second)
 			pauseTaking.Store(false)
 			fmt.Println("▶ Resumed")
 		}()
-	} else {
-		statsMu.Lock()
-		totalLate++
-		statsMu.Unlock()
-		fmt.Printf("   [WS%02d] LATE e2e=%dms amt=%s | %s\n", wsID, e2e, amt, strings.Join(parts, " "))
 	}
 
 	go func() {
