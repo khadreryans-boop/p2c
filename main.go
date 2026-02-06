@@ -28,15 +28,10 @@ const (
 )
 
 const (
-	numWebSockets  = 20
-	numTakers      = 2     // Только 2 лучших
-	parallelTakes  = 2     // Оба делают take
-	warmupInterval = 10000 // 15 сек между warmup (консервативно)
+	numWebSockets = 20
+	numTakers     = 2 // Только 2 лучших
+	parallelTakes = 2 // Оба делают take
 )
-
-// 200 req / 5 min = 40 req/min = 0.66 req/sec
-// 2 takers * 4 warmup/min = 8 warmup/min = 40 за 5 мин
-// Остаётся 160 req на take = 80 заказов
 
 var (
 	pauseTaking atomic.Bool
@@ -47,30 +42,12 @@ var (
 	serverIP    string
 )
 
-// Rate limiter
-var (
-	rateMu      sync.Mutex
-	lastRequest time.Time
-	minGap      = 1500 * time.Millisecond // ~0.66 req/sec max
-)
-
-func rateLimit() bool {
-	rateMu.Lock()
-	defer rateMu.Unlock()
-	if time.Since(lastRequest) < minGap {
-		return false
-	}
-	lastRequest = time.Now()
-	return true
-}
-
 // Stats
 var (
 	statsMu   sync.Mutex
 	totalSeen int
 	totalWon  int
 	totalLate int
-	totalReqs int
 )
 
 // ============ Taker ============
@@ -130,10 +107,6 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 		return 0, 0, fmt.Errorf("no conn")
 	}
 
-	statsMu.Lock()
-	totalReqs++
-	statsMu.Unlock()
-
 	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	t.bw.Write(reqPrefix)
@@ -175,12 +148,8 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 	return code, dur, nil
 }
 
-// Warmup через fake take
-func (t *taker) warmupViaTake() {
-	if !rateLimit() {
-		return
-	}
-
+// Warmup через HEAD (не считается в rate limit)
+func (t *taker) warmup() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -188,17 +157,10 @@ func (t *taker) warmupViaTake() {
 		return
 	}
 
-	statsMu.Lock()
-	totalReqs++
-	statsMu.Unlock()
-
-	fakeID := "000000000000000000000000"
-
 	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	t.bw.Write(reqPrefix)
-	t.bw.WriteString(fakeID)
-	t.bw.Write(reqSuffix)
+	// HEAD запрос - прогревает TCP/TLS/CDN
+	t.bw.WriteString("HEAD /p2c HTTP/1.1\r\nHost: " + host + "\r\nCookie: " + cookie + "\r\nConnection: keep-alive\r\n\r\n")
 
 	start := time.Now()
 	if err := t.bw.Flush(); err != nil {
@@ -208,7 +170,7 @@ func (t *taker) warmupViaTake() {
 		return
 	}
 
-	line, err := t.br.ReadString('\n')
+	_, err := t.br.ReadString('\n')
 	dur := time.Since(start)
 
 	if err != nil {
@@ -218,16 +180,15 @@ func (t *taker) warmupViaTake() {
 		return
 	}
 
-	// Drain
+	// Drain headers
 	for {
-		line, _ = t.br.ReadString('\n')
+		line, _ := t.br.ReadString('\n')
 		if line == "\r\n" || line == "" {
 			break
 		}
 	}
 
 	t.lastRtt.Store(uint64(dur.Milliseconds()))
-	fmt.Printf("   [T%d] warmup rtt=%dms\n", t.id, dur.Milliseconds())
 }
 
 func getAvailable() []*taker {
@@ -547,18 +508,15 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d takers ready\n", ready, numTakers)
 
-	// Warmup goroutines (rate limited)
+	// Warmup goroutines (HEAD - no rate limit)
 	for i, t := range takers {
 		go func(idx int, tk *taker) {
 			// Stagger
-			time.Sleep(time.Duration(idx*7500) * time.Millisecond)
+			time.Sleep(time.Duration(idx*250) * time.Millisecond)
 			for {
-				time.Sleep(time.Duration(warmupInterval) * time.Millisecond)
-				if pauseTaking.Load() {
-					continue
-				}
+				time.Sleep(500 * time.Millisecond) // Часто - HEAD не считается
 				if !tk.inUse.Load() && tk.ready.Load() {
-					tk.warmupViaTake()
+					tk.warmup()
 				} else if !tk.ready.Load() {
 					tk.connect()
 				}
@@ -574,8 +532,7 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | warmup every %ds\n", numWebSockets, numTakers, warmupInterval/1000)
-	fmt.Println("  Rate limit: <200 req / 5 min")
+	fmt.Printf("  %d WS | %d takers | warmup via HEAD (500ms)\n", numWebSockets, numTakers)
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
@@ -587,8 +544,8 @@ func main() {
 			time.Sleep(60 * time.Second)
 			statsMu.Lock()
 			rate := float64(totalWon) / float64(max(totalSeen, 1)) * 100
-			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%%) | total_reqs=%d\n\n",
-				totalSeen, totalWon, totalLate, rate, totalReqs)
+			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%%)\n\n",
+				totalSeen, totalWon, totalLate, rate)
 			statsMu.Unlock()
 		}
 	}()
