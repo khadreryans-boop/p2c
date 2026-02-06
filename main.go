@@ -61,7 +61,6 @@ type httpClient struct {
 	bw       *bufio.Writer
 	mu       sync.Mutex
 	ready    atomic.Bool
-	ewmaUs   atomic.Uint64
 	name     string
 	lastUsed time.Time
 	inUse    atomic.Bool
@@ -72,6 +71,7 @@ type httpClient struct {
 	minLatency    atomic.Uint64
 	maxLatency    atomic.Uint64
 	wins          atomic.Uint64
+	lastRtt       atomic.Uint64
 }
 
 var (
@@ -82,7 +82,6 @@ var (
 func newHTTPClient(name string) *httpClient {
 	c := &httpClient{name: name}
 	c.ready.Store(false)
-	c.ewmaUs.Store(50000)
 	c.minLatency.Store(999999999)
 	return c
 }
@@ -98,7 +97,7 @@ func (c *httpClient) connect() error {
 
 	dialer := &net.Dialer{
 		Timeout:   3 * time.Second,
-		KeepAlive: 15 * time.Second,
+		KeepAlive: 10 * time.Second,
 	}
 
 	tlsConfig := &tls.Config{
@@ -115,7 +114,7 @@ func (c *httpClient) connect() error {
 	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
+		_ = tcpConn.SetKeepAlivePeriod(10 * time.Second)
 	}
 
 	c.conn = conn
@@ -126,12 +125,12 @@ func (c *httpClient) connect() error {
 	return nil
 }
 
-func (c *httpClient) warmup() error {
+func (c *httpClient) warmup() (time.Duration, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conn == nil {
-		return fmt.Errorf("no connection")
+		return 0, fmt.Errorf("no connection")
 	}
 
 	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -144,18 +143,22 @@ func (c *httpClient) warmup() error {
 		"\r\n",
 		host, UA, accessCookieGlobal)
 
+	start := time.Now()
+
 	_, err := c.bw.WriteString(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if err := c.bw.Flush(); err != nil {
-		return err
+		return 0, err
 	}
 
 	line, err := c.br.ReadString('\n')
+	dur := time.Since(start)
+
 	if err != nil {
-		return err
+		return dur, err
 	}
 	_ = line
 
@@ -167,7 +170,8 @@ func (c *httpClient) warmup() error {
 	}
 
 	c.lastUsed = time.Now()
-	return nil
+	c.lastRtt.Store(uint64(dur.Milliseconds()))
+	return dur, nil
 }
 
 func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
@@ -248,13 +252,13 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	}
 
 	c.lastUsed = time.Now()
+	c.lastRtt.Store(uint64(dur.Milliseconds()))
 
 	// Update stats
 	c.totalRequests.Add(1)
 	latMs := uint64(dur.Milliseconds())
 	c.totalLatency.Add(latMs)
 
-	// Update min
 	for {
 		old := c.minLatency.Load()
 		if latMs >= old || c.minLatency.CompareAndSwap(old, latMs) {
@@ -262,7 +266,6 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 		}
 	}
 
-	// Update max
 	for {
 		old := c.maxLatency.Load()
 		if latMs <= old || c.maxLatency.CompareAndSwap(old, latMs) {
@@ -279,13 +282,6 @@ func (c *httpClient) avgLatency() uint64 {
 		return 0
 	}
 	return c.totalLatency.Load() / total
-}
-
-func updateEWMA(old, x uint64) uint64 {
-	if old == 0 {
-		return x
-	}
-	return (old*7 + x*3) / 10
 }
 
 // ============ Parallel Takes ============
@@ -309,7 +305,6 @@ func parallelTake(ev *orderEvent) {
 	results := make(chan takeResult, parallelTakes)
 	var wg sync.WaitGroup
 
-	// Launch parallel takes
 	for i := 0; i < parallelTakes; i++ {
 		c := clients[i]
 		if !c.ready.Load() {
@@ -336,20 +331,17 @@ func parallelTake(ev *orderEvent) {
 		close(results)
 	}()
 
-	// Collect all results
 	var allResults []takeResult
 	for r := range results {
 		allResults = append(allResults, r)
 	}
 
-	// Sort by duration
 	sort.Slice(allResults, func(i, j int) bool {
 		return allResults[i].dur < allResults[j].dur
 	})
 
 	e2eMs := time.Since(ev.wsTime).Milliseconds()
 
-	// Print detailed results
 	var winner *takeResult
 	var rttDetails []string
 
@@ -358,10 +350,6 @@ func parallelTake(ev *orderEvent) {
 			rttDetails = append(rttDetails, fmt.Sprintf("%s:ERR", r.client.name))
 			continue
 		}
-
-		us := uint64(r.dur.Microseconds())
-		old := r.client.ewmaUs.Load()
-		r.client.ewmaUs.Store(updateEWMA(old, us))
 
 		status := fmt.Sprintf("%s:%dms", r.client.name, r.dur.Milliseconds())
 		if r.code == 200 {
@@ -533,7 +521,7 @@ func connectWebSocket(cookie string) (net.Conn, error) {
 			if tc, ok := conn.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
 				_ = tc.SetKeepAlive(true)
-				_ = tc.SetKeepAlivePeriod(15 * time.Second)
+				_ = tc.SetKeepAlivePeriod(10 * time.Second)
 			}
 			return conn, nil
 		},
@@ -592,7 +580,6 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 		wsc := &wsConn{conn: conn}
 		fmt.Printf("[WS%d] 🔌 Connected\n", wsID)
 
-		// Engine.IO OPEN
 		payload, op, err := readFrame(conn)
 		if err != nil {
 			conn.Close()
@@ -607,7 +594,6 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 			continue
 		}
 
-		// Socket.IO connect
 		wsc.writeText([]byte("40"))
 
 		payload, op, err = readFrame(conn)
@@ -616,7 +602,6 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 			continue
 		}
 
-		// Subscribe
 		time.Sleep(50 * time.Millisecond)
 		wsc.writeText([]byte(`42["list:initialize"]`))
 		time.Sleep(50 * time.Millisecond)
@@ -624,7 +609,6 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 
 		fmt.Printf("[WS%d] 🚀 Active\n", wsID)
 
-		// Main loop
 		for {
 			payload, op, err := readFrame(conn)
 			wsTime := time.Now()
@@ -675,15 +659,15 @@ func printStats() {
 		c := clients[i]
 		total := c.totalRequests.Load()
 		if total == 0 {
-			fmt.Printf("   %s: no requests\n", c.name)
+			fmt.Printf("   %s: no requests yet | lastRtt=%dms\n", c.name, c.lastRtt.Load())
 			continue
 		}
 		minLat := c.minLatency.Load()
 		if minLat == 999999999 {
 			minLat = 0
 		}
-		fmt.Printf("   %s: reqs=%d avg=%dms min=%dms max=%dms wins=%d\n",
-			c.name, total, c.avgLatency(), minLat, c.maxLatency.Load(), c.wins.Load())
+		fmt.Printf("   %s: reqs=%d avg=%dms min=%dms max=%dms wins=%d | lastRtt=%dms\n",
+			c.name, total, c.avgLatency(), minLat, c.maxLatency.Load(), c.wins.Load(), c.lastRtt.Load())
 	}
 	fmt.Println("────────────────────────────────────────────")
 }
@@ -694,7 +678,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - 5 WS + 5 Parallel + Stats   ║")
+	fmt.Println("║  P2C SNIPER - Ultra Aggressive Warmup     ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -738,30 +722,37 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d HTTP clients ready\n", ready, numClients)
 
-	// Warmup goroutine
-	go func() {
-		for {
-			for i := 0; i < numClients; i++ {
-				c := clients[i]
+	// ULTRA AGGRESSIVE warmup - каждый клиент каждую секунду!
+	for i := 0; i < numClients; i++ {
+		go func(idx int) {
+			c := clients[idx]
+			for {
+				time.Sleep(1 * time.Second)
+
 				if c.inUse.Load() {
 					continue
 				}
+
 				if !c.ready.Load() {
-					go c.connect()
+					c.connect()
 					continue
 				}
-				if time.Since(c.lastUsed) > 2*time.Second {
-					if err := c.warmup(); err != nil {
-						c.ready.Store(false)
-						go c.connect()
-					}
-				}
-				time.Sleep(400 * time.Millisecond)
-			}
-		}
-	}()
 
-	// Stats printer - every 30 seconds
+				dur, err := c.warmup()
+				if err != nil {
+					c.ready.Store(false)
+					c.connect()
+				} else if dur > 500*time.Millisecond {
+					// Слишком медленно - переподключаемся
+					fmt.Printf("   [%s] warmup slow (%dms), reconnecting\n", c.name, dur.Milliseconds())
+					c.ready.Store(false)
+					c.connect()
+				}
+			}
+		}(i)
+	}
+
+	// Stats every 30 sec
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -782,7 +773,8 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("════════════════════════════════════════════")
-	fmt.Println("  Stats printed every 30 seconds")
+	fmt.Println("  Warmup: every 1 second per client")
+	fmt.Println("  Auto-reconnect if warmup > 500ms")
 	fmt.Println("════════════════════════════════════════════")
 	fmt.Println()
 
