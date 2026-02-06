@@ -25,29 +25,28 @@ const (
 )
 
 var cookie string
-var popIPs []string
 
-// Track results
+// Track who sees first
 var (
-	mu       sync.Mutex
-	seen     = make(map[string]string)    // id -> first source
-	seenTime = make(map[string]time.Time) // id -> time
-	wsWins   int
-	pollWins int
+	ordersMu    sync.Mutex
+	ordersFirst = make(map[string]string)
+	ordersTimes = make(map[string]time.Time)
+	wsWins      int
+	pollWins    int
 )
 
 func recordOrder(id, source string) {
-	mu.Lock()
-	defer mu.Unlock()
+	ordersMu.Lock()
+	defer ordersMu.Unlock()
 
-	if first, exists := seen[id]; exists {
-		delay := time.Since(seenTime[id]).Milliseconds()
-		fmt.Printf("      %s +%dms (first: %s)\n", source, delay, first)
+	if first, exists := ordersFirst[id]; exists {
+		delay := time.Since(ordersTimes[id]).Milliseconds()
+		fmt.Printf("   %s saw %s +%dms (first: %s)\n", source, id[:12], delay, first)
 		return
 	}
 
-	seen[id] = source
-	seenTime[id] = time.Now()
+	ordersFirst[id] = source
+	ordersTimes[id] = time.Now()
 
 	if strings.HasPrefix(source, "WS") {
 		wsWins++
@@ -55,19 +54,19 @@ func recordOrder(id, source string) {
 		pollWins++
 	}
 
-	fmt.Printf("🥇 %s FIRST: %s  [WS:%d POLL:%d]\n", source, id[:16], wsWins, pollWins)
+	fmt.Printf("🥇 %s FIRST: %s (WS:%d POLL:%d)\n", source, id[:12], wsWins, pollWins)
 }
 
 // ============ WebSocket ============
 
 func runWS(id int, ip string) {
-	name := fmt.Sprintf("WS%d", id)
+	source := fmt.Sprintf("WS%d", id)
 	ipShort := ip[strings.LastIndex(ip, ".")+1:]
 
 	for {
 		conn, err := connectWS(ip)
 		if err != nil {
-			fmt.Printf("[%s@%s] connect err: %v\n", name, ipShort, err)
+			fmt.Printf("[%s] connect err: %v\n", source, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -82,12 +81,12 @@ func runWS(id int, ip string) {
 		time.Sleep(30 * time.Millisecond)
 		writeFrame(conn, []byte(`42["list:snapshot",[]]`))
 
-		fmt.Printf("[%s@%s] 🚀 connected\n", name, ipShort)
+		fmt.Printf("[%s@%s] 🚀 connected\n", source, ipShort)
 
 		for {
 			data, op, err := readFrame(conn)
 			if err != nil {
-				fmt.Printf("[%s] disconnected: %v\n", name, err)
+				fmt.Printf("[%s] read err: %v\n", source, err)
 				break
 			}
 
@@ -97,7 +96,7 @@ func runWS(id int, ip string) {
 					continue
 				}
 				if len(data) > 2 && data[0] == '4' && data[1] == '2' {
-					parseOrder(data[2:], name)
+					parseOrder(data[2:], source)
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -157,90 +156,132 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
-// ============ HTTP Polling (stable) ============
+// ============ HTTP Polling ============
 
 type poller struct {
-	id   int
-	ip   string
-	name string
 	conn net.Conn
 	br   *bufio.Reader
 	bw   *bufio.Writer
 	sid  string
 }
 
-func (p *poller) connect() error {
-	conn, err := net.DialTimeout("tcp", p.ip+":443", 5*time.Second)
+func runPoll(id int, ip string) {
+	source := fmt.Sprintf("POLL%d", id)
+	ipShort := ip[strings.LastIndex(ip, ".")+1:]
+
+	for {
+		p, err := newPoller(ip)
+		if err != nil {
+			fmt.Printf("[%s] connect err: %v\n", source, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		fmt.Printf("[%s@%s] 🚀 connected (sid=%s...)\n", source, ipShort, p.sid[:12])
+
+		for {
+			data, err := p.poll()
+			if err != nil {
+				fmt.Printf("[%s] poll err: %v\n", source, err)
+				break
+			}
+
+			// Ping
+			if len(data) == 1 && data[0] == '2' {
+				if err := p.send("3"); err != nil {
+					fmt.Printf("[%s] pong err: %v\n", source, err)
+					break
+				}
+				continue
+			}
+
+			// Parse orders
+			if len(data) > 5 {
+				parseOrder(data, source)
+			}
+		}
+
+		p.conn.Close()
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func newPoller(ip string) (*poller, error) {
+	conn, err := net.DialTimeout("tcp", ip+":443", 5*time.Second)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
-		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(10 * time.Second)
 	}
 
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
-		return err
+		return nil, err
 	}
 
-	p.conn = tlsConn
-	p.br = bufio.NewReaderSize(tlsConn, 32768)
-	p.bw = bufio.NewWriterSize(tlsConn, 4096)
-	return nil
-}
+	p := &poller{
+		conn: tlsConn,
+		br:   bufio.NewReaderSize(tlsConn, 16384),
+		bw:   bufio.NewWriterSize(tlsConn, 4096),
+	}
 
-func (p *poller) handshake() error {
-	// GET handshake
+	// Engine.IO handshake
 	p.conn.SetDeadline(time.Now().Add(10 * time.Second))
+
 	req := "GET " + pollPath + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
 		"Cookie: " + cookie + "\r\n" +
-		"Accept: */*\r\n" +
 		"Connection: keep-alive\r\n\r\n"
 	p.bw.WriteString(req)
 	p.bw.Flush()
 
-	body, err := p.readResponse()
+	body, code, err := p.readResponse()
 	if err != nil {
-		return err
+		p.conn.Close()
+		return nil, fmt.Errorf("handshake read: %v", err)
+	}
+	if code != 200 {
+		p.conn.Close()
+		return nil, fmt.Errorf("handshake code: %d", code)
 	}
 
-	// Parse sid from: 0{"sid":"xxx",...}
+	// Parse sid
 	sidIdx := bytes.Index(body, []byte(`"sid":"`))
 	if sidIdx == -1 {
-		return fmt.Errorf("no sid in: %s", string(body[:min(100, len(body))]))
+		p.conn.Close()
+		return nil, fmt.Errorf("no sid in response")
 	}
 	sidStart := sidIdx + 7
 	sidEnd := bytes.IndexByte(body[sidStart:], '"')
 	if sidEnd == -1 {
-		return fmt.Errorf("bad sid")
+		p.conn.Close()
+		return nil, fmt.Errorf("invalid sid")
 	}
 	p.sid = string(body[sidStart : sidStart+sidEnd])
 
-	// Send Socket.IO connect: 40
+	// Socket.IO connect
 	if err := p.send("40"); err != nil {
-		return err
+		p.conn.Close()
+		return nil, err
 	}
-	// Read ACK
 	if _, err := p.poll(); err != nil {
-		return err
+		p.conn.Close()
+		return nil, err
 	}
 
-	// Initialize
 	time.Sleep(30 * time.Millisecond)
 	p.send(`42["list:initialize"]`)
 	time.Sleep(30 * time.Millisecond)
 	p.send(`42["list:snapshot",[]]`)
 
-	return nil
+	return p, nil
 }
 
 func (p *poller) send(msg string) error {
-	p.conn.SetDeadline(time.Now().Add(10 * time.Second))
+	p.conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	req := fmt.Sprintf("POST %s&sid=%s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
@@ -255,18 +296,22 @@ func (p *poller) send(msg string) error {
 		return err
 	}
 
-	_, err := p.readResponse()
-	return err
+	_, code, err := p.readResponse()
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		return fmt.Errorf("send code: %d", code)
+	}
+	return nil
 }
 
 func (p *poller) poll() ([]byte, error) {
-	// Long timeout - server holds connection up to 25s
-	p.conn.SetDeadline(time.Now().Add(60 * time.Second))
+	p.conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	req := fmt.Sprintf("GET %s&sid=%s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"Cookie: %s\r\n"+
-		"Accept: */*\r\n"+
 		"Connection: keep-alive\r\n\r\n",
 		pollPath, p.sid, host, cookie)
 
@@ -275,31 +320,33 @@ func (p *poller) poll() ([]byte, error) {
 		return nil, err
 	}
 
-	return p.readResponse()
+	body, code, err := p.readResponse()
+	if err != nil {
+		return nil, err
+	}
+	if code != 200 {
+		return nil, fmt.Errorf("poll code: %d", code)
+	}
+	return body, nil
 }
 
-func (p *poller) readResponse() ([]byte, error) {
-	// Status line
+func (p *poller) readResponse() ([]byte, int, error) {
 	line, err := p.br.ReadString('\n')
 	if err != nil {
-		return nil, fmt.Errorf("status: %v", err)
+		return nil, 0, err
 	}
 
-	// Check status code
-	if len(line) >= 12 {
-		code, _ := strconv.Atoi(line[9:12])
-		if code != 200 {
-			return nil, fmt.Errorf("http %d", code)
-		}
+	if len(line) < 12 {
+		return nil, 0, fmt.Errorf("short status: %s", line)
 	}
+	code, _ := strconv.Atoi(strings.TrimSpace(line[9:12]))
 
-	// Headers
 	contentLen := 0
 	chunked := false
 	for {
 		line, err := p.br.ReadString('\n')
 		if err != nil {
-			return nil, fmt.Errorf("header: %v", err)
+			return nil, code, err
 		}
 		if line == "\r\n" {
 			break
@@ -313,13 +360,12 @@ func (p *poller) readResponse() ([]byte, error) {
 		}
 	}
 
-	// Body
 	var body []byte
 	if chunked {
 		for {
 			sizeLine, err := p.br.ReadString('\n')
 			if err != nil {
-				return body, err
+				return body, code, err
 			}
 			sizeLine = strings.TrimSpace(sizeLine)
 			size, _ := strconv.ParseInt(sizeLine, 16, 64)
@@ -330,7 +376,7 @@ func (p *poller) readResponse() ([]byte, error) {
 			chunk := make([]byte, size)
 			_, err = io.ReadFull(p.br, chunk)
 			if err != nil {
-				return body, err
+				return body, code, err
 			}
 			body = append(body, chunk...)
 			p.br.ReadString('\n')
@@ -338,82 +384,26 @@ func (p *poller) readResponse() ([]byte, error) {
 	} else if contentLen > 0 {
 		body = make([]byte, contentLen)
 		_, err = io.ReadFull(p.br, body)
+		if err != nil {
+			return body, code, err
+		}
 	}
 
-	return body, err
-}
-
-func (p *poller) close() {
-	if p.conn != nil {
-		p.conn.Close()
-		p.conn = nil
-	}
-}
-
-func runPoll(id int, ip string) {
-	ipShort := ip[strings.LastIndex(ip, ".")+1:]
-	p := &poller{id: id, ip: ip, name: fmt.Sprintf("POLL%d", id)}
-
-	for {
-		// Connect
-		if err := p.connect(); err != nil {
-			fmt.Printf("[%s@%s] connect err: %v\n", p.name, ipShort, err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		// Handshake
-		if err := p.handshake(); err != nil {
-			fmt.Printf("[%s@%s] handshake err: %v\n", p.name, ipShort, err)
-			p.close()
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		fmt.Printf("[%s@%s] 🚀 connected (sid=%s...)\n", p.name, ipShort, p.sid[:12])
-
-		// Poll loop
-		for {
-			data, err := p.poll()
-			if err != nil {
-				fmt.Printf("[%s] disconnected: %v\n", p.name, err)
-				break
-			}
-
-			// Handle ping
-			if len(data) == 1 && data[0] == '2' {
-				p.send("3")
-				continue
-			}
-
-			// Parse orders
-			if len(data) > 5 {
-				parseOrder(data, p.name)
-			}
-		}
-
-		p.close()
-		time.Sleep(1 * time.Second)
-	}
+	return body, code, nil
 }
 
 // ============ Parser ============
 
-var (
-	opAddBytes = []byte(`"op":"add"`)
-	idPrefix   = []byte(`"id":"`)
-)
-
 func parseOrder(data []byte, source string) {
-	if !bytes.Contains(data, opAddBytes) {
+	if !bytes.Contains(data, []byte(`"op":"add"`)) {
 		return
 	}
 
-	idx := bytes.Index(data, idPrefix)
-	if idx == -1 {
+	idIdx := bytes.Index(data, []byte(`"id":"`))
+	if idIdx == -1 {
 		return
 	}
-	start := idx + 6
+	start := idIdx + 6
 	end := bytes.IndexByte(data[start:], '"')
 	if end == -1 || end > 30 {
 		return
@@ -429,7 +419,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE TEST: 3 WS vs 3 POLL                ║")
+	fmt.Println("║  RACE: 2 WS vs 2 POLL - Who Wins?         ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -446,27 +436,24 @@ func main() {
 		fmt.Printf("DNS error: %v\n", err)
 		return
 	}
-	popIPs = ips
-	fmt.Printf("✅ Found %d POPs: %v\n", len(popIPs), popIPs)
+	fmt.Printf("✅ Found %d POPs: %v\n", len(ips), ips)
 
-	// Start 3 WebSockets
-	fmt.Println("\n⏳ Starting 3 WebSockets...")
-	for i := 1; i <= 3; i++ {
-		go runWS(i, popIPs[(i-1)%len(popIPs)])
-		time.Sleep(100 * time.Millisecond)
-	}
+	// Start 2 WebSockets on different IPs
+	fmt.Println("\n⏳ Starting 2 WebSockets...")
+	go runWS(1, ips[0])
+	time.Sleep(100 * time.Millisecond)
+	go runWS(2, ips[1%len(ips)])
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 
-	// Start 3 Pollers
-	fmt.Println("⏳ Starting 3 Pollers...")
-	for i := 1; i <= 3; i++ {
-		go runPoll(i, popIPs[(i-1)%len(popIPs)])
-		time.Sleep(100 * time.Millisecond)
-	}
+	// Start 2 Pollers on different IPs
+	fmt.Println("⏳ Starting 2 Pollers...")
+	go runPoll(1, ips[0])
+	time.Sleep(100 * time.Millisecond)
+	go runPoll(2, ips[1%len(ips)])
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  3 WS vs 3 POLL - watching for orders...")
+	fmt.Println("  2 WS vs 2 POLL - watching for orders...")
 	fmt.Println("  🥇 = first to see order")
 	fmt.Println("════════════════════════════════════════════\n")
 
