@@ -60,7 +60,6 @@ func recordOrder(id, source string) {
 	} else {
 		pollWins++
 	}
-
 	fmt.Printf("🥇 %s FIRST: %s (WS:%d POLL:%d)\n", source, id[:min(12, len(id))], wsWins, pollWins)
 }
 
@@ -77,7 +76,7 @@ func runWS(ip string) {
 
 		_, _, _ = readFrame(conn) // "0{...}"
 		_ = writeFrame(conn, []byte("40"))
-		_, _, _ = readFrame(conn) // "40" ack
+		_, _, _ = readFrame(conn) // "40"
 
 		time.Sleep(30 * time.Millisecond)
 		_ = writeFrame(conn, []byte(`42["list:initialize"]`))
@@ -171,9 +170,9 @@ type eioHandshake struct {
 	PingTimeout  int    `json:"pingTimeout"`  // ms
 }
 
-func runPoll(ip string) {
+func runPoll() {
 	for {
-		conn, br, bw, sid, readWait, err := pollConnect(ip)
+		conn, br, bw, sid, readWait, err := pollConnect()
 		if err != nil {
 			fmt.Printf("[POLL] connect err: %v\n", err)
 			time.Sleep(2 * time.Second)
@@ -190,31 +189,27 @@ func runPoll(ip string) {
 			fmt.Fprintf(bw, "Host: %s\r\n", host)
 			fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
 			fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
-			fmt.Fprintf(bw, "Connection: keep-alive\r\n")
-			fmt.Fprintf(bw, "\r\n")
+			fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
 			if err := bw.Flush(); err != nil {
 				fmt.Printf("[POLL] flush err: %v\n", err)
 				break
 			}
 
 			_ = conn.SetReadDeadline(time.Now().Add(readWait))
-
 			body, code := readHTTPResponse(br)
 			if code != 200 {
-				fmt.Printf("[POLL] poll code: %d (len=%d) body=%q\n", code, len(body), safeBody(body))
+				fmt.Printf("[POLL] poll code: %d body=%q\n", code, safeBody(body))
 				break
 			}
 			if len(body) == 0 {
 				continue
 			}
 
-			packets := splitEIOPayload(body)
-			for _, p := range packets {
+			for _, p := range splitEIOPayload(body) {
 				if len(p) == 0 {
 					continue
 				}
 
-				// ping "2" => POST payload with "3"
 				if len(p) == 1 && p[0] == '2' {
 					if err := pollPostPackets(conn, br, bw, sid, "3"); err != nil {
 						fmt.Printf("[POLL] pong err: %v\n", err)
@@ -223,10 +218,8 @@ func runPoll(ip string) {
 					continue
 				}
 
-				// socket.io message "42[...]"
 				if len(p) > 2 && p[0] == '4' && p[1] == '2' {
 					parseOrder(p[2:], "POLL")
-					continue
 				}
 			}
 		}
@@ -237,11 +230,12 @@ func runPoll(ip string) {
 	}
 }
 
-func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, time.Duration, error) {
+func pollConnect() (net.Conn, *bufio.Reader, *bufio.Writer, string, time.Duration, error) {
+	// ВАЖНО: не фиксируем IP. Иначе SID может “умереть” на другом инстансе.
 	conn, err := tls.DialWithDialer(
 		&net.Dialer{Timeout: 5 * time.Second},
 		"tcp",
-		ip+":443",
+		host+":443",
 		&tls.Config{ServerName: host},
 	)
 	if err != nil {
@@ -251,7 +245,7 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 	br := bufio.NewReaderSize(conn, 1<<16)
 	bw := bufio.NewWriterSize(conn, 1<<12)
 
-	// 1) Handshake GET => ждём open packet '0{...}'
+	// Handshake GET
 	{
 		t := time.Now().UnixNano()
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -259,8 +253,7 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 		fmt.Fprintf(bw, "Host: %s\r\n", host)
 		fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
 		fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
-		fmt.Fprintf(bw, "Connection: keep-alive\r\n")
-		fmt.Fprintf(bw, "\r\n")
+		fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
 		if err := bw.Flush(); err != nil {
 			_ = conn.Close()
 			return nil, nil, nil, "", 0, err
@@ -285,7 +278,7 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 		}
 		if !found {
 			_ = conn.Close()
-			return nil, nil, nil, "", 0, fmt.Errorf("no open packet in handshake body=%q", safeBody(body))
+			return nil, nil, nil, "", 0, fmt.Errorf("no open packet body=%q", safeBody(body))
 		}
 
 		sid := hs.SID
@@ -297,13 +290,13 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 			readWait = 180 * time.Second
 		}
 
-		// 2) POST connect packet "40" НО как payload len:packet
+		// POST "40" как payload
 		if err := pollPostPackets(conn, br, bw, sid, "40"); err != nil {
 			_ = conn.Close()
 			return nil, nil, nil, "", 0, err
 		}
 
-		// 3) один GET чтобы снять ack/буфер
+		// GET ack
 		{
 			t3 := time.Now().UnixNano()
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -311,8 +304,7 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 			fmt.Fprintf(bw, "Host: %s\r\n", host)
 			fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
 			fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
-			fmt.Fprintf(bw, "Connection: keep-alive\r\n")
-			fmt.Fprintf(bw, "\r\n")
+			fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
 			if err := bw.Flush(); err != nil {
 				_ = conn.Close()
 				return nil, nil, nil, "", 0, err
@@ -324,10 +316,10 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 				_ = conn.Close()
 				return nil, nil, nil, "", 0, fmt.Errorf("ack code: %d body=%q", code, safeBody(body))
 			}
-			_ = body // можно логировать при желании
+			_ = body
 		}
 
-		// 4) init events
+		// init events
 		time.Sleep(30 * time.Millisecond)
 		if err := pollPostPackets(conn, br, bw, sid, `42["list:initialize"]`); err != nil {
 			_ = conn.Close()
@@ -343,7 +335,6 @@ func pollConnect(ip string) (net.Conn, *bufio.Reader, *bufio.Writer, string, tim
 	}
 }
 
-// ВАЖНО: Engine.IO polling POST body должен быть payload "len:packetlen:packet..."
 func encodeEIOPayload(packets ...string) string {
 	var b strings.Builder
 	for _, p := range packets {
@@ -365,8 +356,7 @@ func pollPostPackets(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, sid stri
 	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
 	fmt.Fprintf(bw, "Content-Type: text/plain;charset=UTF-8\r\n")
 	fmt.Fprintf(bw, "Content-Length: %d\r\n", len(payload))
-	fmt.Fprintf(bw, "Connection: keep-alive\r\n")
-	fmt.Fprintf(bw, "\r\n")
+	fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
 	fmt.Fprintf(bw, "%s", payload)
 
 	if err := bw.Flush(); err != nil {
@@ -381,8 +371,6 @@ func pollPostPackets(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, sid stri
 	return nil
 }
 
-// splitEIOPayload splits Engine.IO polling payload into packets.
-// supports 0x1e separator and length-prefixed "len:packet" format.
 func splitEIOPayload(b []byte) [][]byte {
 	if len(b) == 0 {
 		return nil
@@ -494,12 +482,10 @@ func readHTTPResponse(br *bufio.Reader) ([]byte, int) {
 		body = make([]byte, contentLen)
 		_, _ = io.ReadFull(br, body)
 	}
-
 	return body, code
 }
 
 func safeBody(b []byte) string {
-	// чтобы не спамить огромными ответами
 	s := string(b)
 	if len(s) > 200 {
 		return s[:200] + "..."
@@ -534,7 +520,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: 1 WS vs 1 POLL (poll payload fix)  ║")
+	fmt.Println("║  RACE: 1 WS vs 1 POLL (sticky SID fix)    ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -545,22 +531,22 @@ func main() {
 		return
 	}
 
-	fmt.Println("\n⏳ Resolving DNS...")
+	fmt.Println("\n⏳ Resolving DNS (for WS only)...")
 	ips, err := net.LookupHost(host)
 	if err != nil {
 		fmt.Printf("DNS error: %v\n", err)
 		return
 	}
 	ip := ips[0]
-	fmt.Printf("✅ Using IP: %s\n", ip)
+	fmt.Printf("✅ WS using IP: %s\n", ip)
 
 	fmt.Println("\n⏳ Starting WebSocket...")
 	go runWS(ip)
 
 	time.Sleep(2 * time.Second)
 
-	fmt.Println("⏳ Starting Polling...")
-	go runPoll(ip)
+	fmt.Println("⏳ Starting Polling (no fixed IP)...")
+	go runPoll()
 
 	fmt.Println("\n════════════════════════════════════════════")
 	fmt.Println("  1 WS vs 1 POLL")
