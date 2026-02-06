@@ -29,9 +29,9 @@ const (
 
 const (
 	numWebSockets  = 20
-	numTakers      = 2    // Только 2 лучших
-	parallelTakes  = 2    // Оба делают take
-	warmupInterval = 5000 // 15 сек между warmup (консервативно)
+	numTakers      = 2     // Только 2 лучших
+	parallelTakes  = 2     // Оба делают take
+	warmupInterval = 10000 // 15 сек между warmup (консервативно)
 )
 
 // 200 req / 5 min = 40 req/min = 0.66 req/sec
