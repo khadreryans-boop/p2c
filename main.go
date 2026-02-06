@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -30,10 +29,14 @@ const (
 
 const (
 	numWebSockets  = 20
-	numTakers      = 10 // Меньше takers, чаще warmup
-	parallelTakes  = 5
-	warmupInterval = 2000 // ms между warmup (5 req/sec = 200ms минимум)
+	numTakers      = 2    // Только 2 лучших
+	parallelTakes  = 2    // Оба делают take
+	warmupInterval = 5000 // 15 сек между warmup (консервативно)
 )
+
+// 200 req / 5 min = 40 req/min = 0.66 req/sec
+// 2 takers * 4 warmup/min = 8 warmup/min = 40 за 5 мин
+// Остаётся 160 req на take = 80 заказов
 
 var (
 	pauseTaking atomic.Bool
@@ -44,12 +47,22 @@ var (
 	serverIP    string
 )
 
-// Rate limiter for warmup
+// Rate limiter
 var (
-	warmupMu     sync.Mutex
-	lastWarmup   time.Time
-	warmupMinGap = 200 * time.Millisecond // 5 req/sec max
+	rateMu      sync.Mutex
+	lastRequest time.Time
+	minGap      = 1500 * time.Millisecond // ~0.66 req/sec max
 )
+
+func rateLimit() bool {
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	if time.Since(lastRequest) < minGap {
+		return false
+	}
+	lastRequest = time.Now()
+	return true
+}
 
 // Stats
 var (
@@ -57,6 +70,7 @@ var (
 	totalSeen int
 	totalWon  int
 	totalLate int
+	totalReqs int
 )
 
 // ============ Taker ============
@@ -91,7 +105,7 @@ func (t *taker) connect() error {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 		tc.SetKeepAlive(true)
-		tc.SetKeepAlivePeriod(10 * time.Second)
+		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
@@ -115,6 +129,10 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 	if t.conn == nil {
 		return 0, 0, fmt.Errorf("no conn")
 	}
+
+	statsMu.Lock()
+	totalReqs++
+	statsMu.Unlock()
 
 	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
@@ -141,12 +159,9 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 	}
 
 	if len(line) < 12 {
-		return 0, dur, fmt.Errorf("short: %q", line)
+		return 0, dur, fmt.Errorf("short")
 	}
 	code, _ := strconv.Atoi(line[9:12])
-	if code == 0 {
-		fmt.Printf("DEBUG response: %q\n", line[:min(len(line), 50)])
-	}
 
 	// Drain
 	for {
@@ -160,17 +175,11 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 	return code, dur, nil
 }
 
-// Warmup через fake take - прогревает весь путь до /take/ endpoint
+// Warmup через fake take
 func (t *taker) warmupViaTake() {
-	// Rate limit
-	warmupMu.Lock()
-	elapsed := time.Since(lastWarmup)
-	if elapsed < warmupMinGap {
-		warmupMu.Unlock()
+	if !rateLimit() {
 		return
 	}
-	lastWarmup = time.Now()
-	warmupMu.Unlock()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -179,10 +188,13 @@ func (t *taker) warmupViaTake() {
 		return
 	}
 
-	// Fake order ID - will return 400 but warms up the path
-	fakeID := fmt.Sprintf("000000000000000000000000")
+	statsMu.Lock()
+	totalReqs++
+	statsMu.Unlock()
 
-	t.conn.SetDeadline(time.Now().Add(1 * time.Second))
+	fakeID := "000000000000000000000000"
+
+	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	t.bw.Write(reqPrefix)
 	t.bw.WriteString(fakeID)
@@ -206,7 +218,7 @@ func (t *taker) warmupViaTake() {
 		return
 	}
 
-	// Drain response
+	// Drain
 	for {
 		line, _ = t.br.ReadString('\n')
 		if line == "\r\n" || line == "" {
@@ -215,26 +227,17 @@ func (t *taker) warmupViaTake() {
 	}
 
 	t.lastRtt.Store(uint64(dur.Milliseconds()))
+	fmt.Printf("   [T%d] warmup rtt=%dms\n", t.id, dur.Milliseconds())
 }
 
-func getBest(n int) []*taker {
-	type tr struct {
-		t   *taker
-		rtt uint64
-	}
-	var avail []tr
+func getAvailable() []*taker {
+	var avail []*taker
 	for _, t := range takers {
 		if t.ready.Load() && !t.inUse.Load() {
-			avail = append(avail, tr{t, t.lastRtt.Load()})
+			avail = append(avail, t)
 		}
 	}
-	sort.Slice(avail, func(i, j int) bool { return avail[i].rtt < avail[j].rtt })
-
-	var res []*taker
-	for i := 0; i < len(avail) && i < n; i++ {
-		res = append(res, avail[i].t)
-	}
-	return res
+	return avail
 }
 
 // ============ Take Logic ============
@@ -251,8 +254,8 @@ func doTake(id, amt string, wsID int, detectTime time.Time) {
 	totalSeen++
 	statsMu.Unlock()
 
-	best := getBest(parallelTakes)
-	if len(best) == 0 {
+	avail := getAvailable()
+	if len(avail) == 0 {
 		fmt.Printf("   ❌ No takers\n")
 		return
 	}
@@ -264,8 +267,8 @@ func doTake(id, amt string, wsID int, detectTime time.Time) {
 		err  error
 	}
 
-	ch := make(chan res, len(best))
-	for _, t := range best {
+	ch := make(chan res, len(avail))
+	for _, t := range avail {
 		t.inUse.Store(true)
 		go func(tk *taker) {
 			code, dur, err := tk.take(id)
@@ -278,7 +281,7 @@ func doTake(id, amt string, wsID int, detectTime time.Time) {
 	}
 
 	var results []res
-	for i := 0; i < len(best); i++ {
+	for i := 0; i < len(avail); i++ {
 		results = append(results, <-ch)
 	}
 
@@ -297,6 +300,8 @@ func doTake(id, amt string, wsID int, detectTime time.Time) {
 		if r.code == 200 {
 			s += "✓"
 			won = true
+		} else if r.code == 429 {
+			s += "(RATE)"
 		} else {
 			s += fmt.Sprintf("(%d)", r.code)
 		}
@@ -490,11 +495,10 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 // ============ Main ============
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - Warmup via Take             ║")
+	fmt.Println("║  P2C SNIPER - 2 Takers (Rate Limited)     ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -526,7 +530,7 @@ func main() {
 	reqPrefix = []byte("POST " + takePathPrefix)
 	reqSuffix = []byte(" HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: application/json\r\nCookie: " + cookie + "\r\nContent-Length: 2\r\n\r\n{}")
 
-	// Create takers
+	// Create 2 takers
 	fmt.Printf("\n⏳ Creating %d takers...\n", numTakers)
 	for i := 0; i < numTakers; i++ {
 		t := &taker{id: i + 1}
@@ -543,11 +547,11 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d takers ready\n", ready, numTakers)
 
-	// Warmup goroutines - via fake take (rate limited)
+	// Warmup goroutines (rate limited)
 	for i, t := range takers {
 		go func(idx int, tk *taker) {
-			// Stagger start
-			time.Sleep(time.Duration(idx*200) * time.Millisecond)
+			// Stagger
+			time.Sleep(time.Duration(idx*7500) * time.Millisecond)
 			for {
 				time.Sleep(time.Duration(warmupInterval) * time.Millisecond)
 				if pauseTaking.Load() {
@@ -570,8 +574,8 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | %d parallel\n", numWebSockets, numTakers, parallelTakes)
-	fmt.Printf("  Warmup: via /take/ every %dms (rate limited 5/sec)\n", warmupInterval)
+	fmt.Printf("  %d WS | %d takers | warmup every %ds\n", numWebSockets, numTakers, warmupInterval/1000)
+	fmt.Println("  Rate limit: <200 req / 5 min")
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
@@ -583,8 +587,8 @@ func main() {
 			time.Sleep(60 * time.Second)
 			statsMu.Lock()
 			rate := float64(totalWon) / float64(max(totalSeen, 1)) * 100
-			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%% success)\n\n",
-				totalSeen, totalWon, totalLate, rate)
+			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%%) | total_reqs=%d\n\n",
+				totalSeen, totalWon, totalLate, rate, totalReqs)
 			statsMu.Unlock()
 		}
 	}()
@@ -594,13 +598,6 @@ func main() {
 
 func max(a, b int) int {
 	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
 		return a
 	}
 	return b
