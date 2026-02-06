@@ -5,8 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -17,7 +18,6 @@ import (
 	"time"
 
 	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
 )
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -31,41 +31,62 @@ const (
 	pauseSeconds   = 20
 )
 
-const numClients = 40
+const numClients = 20
+const numWebSockets = 5
 
 var (
 	pauseTaking atomic.Bool
 	seenOrders  sync.Map
 )
 
+// ============ Order Event ============
+
+type orderEvent struct {
+	id      string
+	amtStr  string
+	wsID    int
+	wsTime  time.Time
+	handled atomic.Bool
+}
+
+var pendingOrders sync.Map
+
 // ============ HTTP Client Pool ============
 
 type httpClient struct {
-	conn   net.Conn
-	br     *bufio.Reader
-	bw     *bufio.Writer
-	mu     sync.Mutex
-	ready  atomic.Bool
-	ewmaUs atomic.Uint64
-	name   string
+	conn     net.Conn
+	br       *bufio.Reader
+	bw       *bufio.Writer
+	mu       sync.Mutex
+	ready    atomic.Bool
+	ewmaUs   atomic.Uint64
+	name     string
+	lastUsed time.Time
 }
 
 var (
 	clients            [numClients]*httpClient
 	accessCookieGlobal string
-	cookieHeader       []byte
 )
 
 func newHTTPClient(name string) *httpClient {
 	c := &httpClient{name: name}
 	c.ready.Store(false)
-	c.ewmaUs.Store(15000)
+	c.ewmaUs.Store(50000)
 	return c
 }
 
 func (c *httpClient) connect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+
 	dialer := &net.Dialer{
-		Timeout:   2 * time.Second,
+		Timeout:   3 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
@@ -86,86 +107,135 @@ func (c *httpClient) connect() error {
 
 	c.conn = conn
 	c.br = bufio.NewReaderSize(conn, 4096)
-	c.bw = bufio.NewWriterSize(conn, 4096)
+	c.bw = bufio.NewWriterSize(conn, 2048)
+	c.lastUsed = time.Now()
 	c.ready.Store(true)
 	return nil
 }
 
-func (c *httpClient) reconnect() {
-	if c.conn != nil {
-		c.conn.Close()
-	}
-	c.ready.Store(false)
-
-	for i := 0; i < 3; i++ {
-		if err := c.connect(); err == nil {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-var takeReqTemplate = []byte("POST " + takePathPrefix)
-var takeReqSuffix = []byte(` HTTP/1.1
-Host: app.send.tg
-Content-Type: application/json
-Accept: application/json
-Origin: https://app.send.tg
-Referer: https://app.send.tg/p2c/orders
-Content-Length: 2
-Connection: keep-alive
-User-Agent: ` + UA + `
-`)
-
-func (c *httpClient) doTake(orderID string) (int, time.Duration) {
+func (c *httpClient) warmup() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conn == nil {
-		c.reconnect()
-		if c.conn == nil {
-			return 0, 0
+		return fmt.Errorf("no connection")
+	}
+
+	_ = c.conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	req := fmt.Sprintf("HEAD /p2c/orders HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"User-Agent: %s\r\n"+
+		"Cookie: %s\r\n"+
+		"Connection: keep-alive\r\n"+
+		"\r\n",
+		host, UA, accessCookieGlobal)
+
+	_, err := c.bw.WriteString(req)
+	if err != nil {
+		return err
+	}
+
+	if err := c.bw.Flush(); err != nil {
+		return err
+	}
+
+	line, err := c.br.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	_ = line
+
+	for {
+		line, err = c.br.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
 		}
 	}
 
-	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
+	c.lastUsed = time.Now()
+	return nil
+}
 
-	c.bw.Write(takeReqTemplate)
-	c.bw.WriteString(orderID)
-	c.bw.Write(takeReqSuffix)
-	c.bw.Write(cookieHeader)
-	c.bw.WriteString("\r\n{}")
+func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil {
+		return 0, 0, fmt.Errorf("no connection")
+	}
+
+	_ = c.conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	req := fmt.Sprintf("POST %s%s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Accept: application/json\r\n"+
+		"Origin: %s\r\n"+
+		"Referer: %s\r\n"+
+		"User-Agent: %s\r\n"+
+		"Cookie: %s\r\n"+
+		"Content-Length: 2\r\n"+
+		"Connection: keep-alive\r\n"+
+		"\r\n{}",
+		takePathPrefix, orderID, host, origin, referer, UA, accessCookieGlobal)
 
 	start := time.Now()
+	_, err := c.bw.WriteString(req)
+	if err != nil {
+		c.conn.Close()
+		c.conn = nil
+		c.ready.Store(false)
+		return 0, 0, err
+	}
+
 	if err := c.bw.Flush(); err != nil {
-		c.reconnect()
-		return 0, 0
+		c.conn.Close()
+		c.conn = nil
+		c.ready.Store(false)
+		return 0, 0, err
 	}
 
 	line, err := c.br.ReadString('\n')
 	dur := time.Since(start)
 
 	if err != nil {
-		c.reconnect()
-		return 0, dur
+		c.conn.Close()
+		c.conn = nil
+		c.ready.Store(false)
+		return 0, dur, err
 	}
 
 	if len(line) < 12 {
-		c.reconnect()
-		return 0, dur
+		c.conn.Close()
+		c.conn = nil
+		c.ready.Store(false)
+		return 0, dur, fmt.Errorf("short response")
 	}
 	code, _ := strconv.Atoi(line[9:12])
 
+	contentLength := 0
 	for {
 		line, err := c.br.ReadString('\n')
-		if err != nil || line == "\r\n" {
+		if err != nil {
 			break
 		}
+		if line == "\r\n" {
+			break
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "content-length:") {
+			fmt.Sscanf(line[15:], "%d", &contentLength)
+		}
 	}
-	body := make([]byte, 512)
-	c.br.Read(body)
 
-	return code, dur
+	if contentLength > 0 {
+		body := make([]byte, contentLength)
+		io.ReadFull(c.br, body)
+	}
+
+	c.lastUsed = time.Now()
+	return code, dur, nil
 }
 
 func pickBestClient() *httpClient {
@@ -184,13 +254,6 @@ func pickBestClient() *httpClient {
 		}
 	}
 
-	if best == nil {
-		for i := 0; i < numClients; i++ {
-			if clients[i].conn != nil {
-				return clients[i]
-			}
-		}
-	}
 	return best
 }
 
@@ -198,61 +261,76 @@ func updateEWMA(old, x uint64) uint64 {
 	if old == 0 {
 		return x
 	}
-	return (old*8 + x*2) / 10
+	return (old*7 + x*3) / 10
 }
 
 // ============ Ultra-fast Take ============
 
-func ultraFastTake(id, amtStr string, wsTime time.Time) {
+func ultraFastTake(ev *orderEvent) {
 	if pauseTaking.Load() {
 		return
 	}
 
-	if _, loaded := seenOrders.LoadOrStore(id, struct{}{}); loaded {
+	if !ev.handled.CompareAndSwap(false, true) {
 		return
 	}
 
 	client := pickBestClient()
 	if client == nil {
-		fmt.Printf("❌ NO CLIENT for %s\n", id)
+		fmt.Printf("   ❌ NO CLIENT\n")
 		return
 	}
 
 	client.ready.Store(false)
-	code, dur := client.doTake(id)
-	client.ready.Store(true)
+	code, dur, err := client.doTake(ev.id)
+
+	if err != nil {
+		fmt.Printf("   ❌ [WS%d] %s ERROR: %v\n", ev.wsID, client.name, err)
+		go client.connect()
+
+		client2 := pickBestClient()
+		if client2 != nil {
+			client2.ready.Store(false)
+			code, dur, err = client2.doTake(ev.id)
+			client2.ready.Store(true)
+			if err != nil {
+				return
+			}
+			client = client2
+		} else {
+			return
+		}
+	} else {
+		client.ready.Store(true)
+	}
 
 	us := uint64(dur.Microseconds())
-	if code == 0 {
-		us = 2_000_000
-	}
 	old := client.ewmaUs.Load()
 	client.ewmaUs.Store(updateEWMA(old, us))
 
 	rttMs := dur.Milliseconds()
-	e2eMs := time.Since(wsTime).Milliseconds()
+	e2eMs := time.Since(ev.wsTime).Milliseconds()
 
 	if code == 200 {
-		fmt.Printf("✅ TAKEN %s rtt=%dms e2e=%dms id=%s amt=%s\n",
-			client.name, rttMs, e2eMs, id, amtStr)
+		fmt.Printf("✅ TAKEN [WS%d] %s rtt=%dms e2e=%dms id=%s amt=%s\n",
+			ev.wsID, client.name, rttMs, e2eMs, ev.id, ev.amtStr)
 
 		pauseTaking.Store(true)
 		go func() {
 			time.Sleep(pauseSeconds * time.Second)
 			pauseTaking.Store(false)
+			fmt.Println("▶ Resumed")
 		}()
 		return
 	}
 
 	if code == 400 || code == 404 || code == 409 {
-		fmt.Printf("LATE %s HTTP=%d rtt=%dms e2e=%dms id=%s\n",
-			client.name, code, rttMs, e2eMs, id)
+		fmt.Printf("   LATE [WS%d] %s HTTP=%d rtt=%dms e2e=%dms\n",
+			ev.wsID, client.name, code, rttMs, e2eMs)
 		return
 	}
 
-	if code != 0 {
-		fmt.Printf("ERR %s HTTP=%d rtt=%dms id=%s\n", client.name, code, rttMs, id)
-	}
+	fmt.Printf("   ERR [WS%d] %s HTTP=%d rtt=%dms\n", ev.wsID, client.name, code, rttMs)
 }
 
 // ============ Speculative Parser ============
@@ -299,7 +377,7 @@ var (
 	amtPrefixBytes = []byte(`"in_amount":"`)
 )
 
-func speculativeParse(msg []byte, wsTime time.Time, minCents int64) {
+func speculativeParse(msg []byte, wsTime time.Time, wsID int, minCents int64) {
 	if !bytes.Contains(msg, opAddBytes) {
 		return
 	}
@@ -332,28 +410,49 @@ func speculativeParse(msg []byte, wsTime time.Time, minCents int64) {
 		}
 	}
 
-	fmt.Printf("📥 NEW: %s amt=%s\n", id, amtStr)
-	go ultraFastTake(id, amtStr, wsTime)
+	ev := &orderEvent{
+		id:     id,
+		amtStr: amtStr,
+		wsID:   wsID,
+		wsTime: wsTime,
+	}
+
+	existing, loaded := pendingOrders.LoadOrStore(id, ev)
+	if loaded {
+		existingEv := existing.(*orderEvent)
+		delay := wsTime.Sub(existingEv.wsTime)
+		if delay > time.Millisecond {
+			fmt.Printf("   [WS%d] +%v (WS%d was first)\n", wsID, delay.Round(100*time.Microsecond), existingEv.wsID)
+		}
+		return
+	}
+
+	fmt.Printf("📥 [WS%d] NEW: %s amt=%s\n", wsID, id, amtStr)
+	ultraFastTake(ev)
+
+	go func() {
+		time.Sleep(5 * time.Second)
+		pendingOrders.Delete(id)
+	}()
 }
 
-// ============ WebSocket (gobwas/ws) ============
+// ============ WebSocket ============
 
 type wsConn struct {
-	conn    net.Conn
-	writeMu sync.Mutex
+	conn net.Conn
+	mu   sync.Mutex
 }
 
-func (w *wsConn) write(msg []byte) error {
-	w.writeMu.Lock()
-	defer w.writeMu.Unlock()
-	return wsutil.WriteClientText(w.conn, msg)
+func (w *wsConn) writeText(msg []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	frame := ws.NewTextFrame(msg)
+	frame = ws.MaskFrameInPlace(frame)
+	return ws.WriteFrame(w.conn, frame)
 }
 
-func (w *wsConn) read() ([]byte, ws.OpCode, error) {
-	return wsutil.ReadServerData(w.conn)
-}
-
-func connectWebSocket(cookie string) (*wsConn, error) {
+func connectWebSocket(cookie string) (net.Conn, error) {
 	dialer := ws.Dialer{
 		Header: ws.HandshakeHeaderHTTP(http.Header{
 			"Host":            []string{host},
@@ -385,148 +484,127 @@ func connectWebSocket(cookie string) (*wsConn, error) {
 	}
 
 	conn, _, _, err := dialer.Dial(context.Background(), "wss://"+host+wsPath)
+	return conn, err
+}
+
+func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
+	header, err := ws.ReadHeader(conn)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return &wsConn{conn: conn}, nil
-}
-
-// Engine.IO open packet
-type eioOpen struct {
-	Sid          string `json:"sid"`
-	PingInterval int    `json:"pingInterval"`
-	PingTimeout  int    `json:"pingTimeout"`
-}
-
-func runWebSocket(cookie string, minCents int64) {
-	for {
-		wsc, err := connectWebSocket(cookie)
+	payload := make([]byte, header.Length)
+	if header.Length > 0 {
+		_, err = io.ReadFull(conn, payload)
 		if err != nil {
-			fmt.Println("WS connect error:", err)
+			return nil, 0, err
+		}
+	}
+
+	if header.Masked {
+		ws.Cipher(payload, header.Mask, 0)
+	}
+
+	return payload, header.OpCode, nil
+}
+
+func parseCloseReason(payload []byte) (code uint16, reason string) {
+	if len(payload) >= 2 {
+		code = binary.BigEndian.Uint16(payload[:2])
+		if len(payload) > 2 {
+			reason = string(payload[2:])
+		}
+	}
+	return
+}
+
+func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		conn, err := connectWebSocket(cookie)
+		if err != nil {
+			fmt.Printf("[WS%d] Connect error: %v\n", wsID, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		fmt.Println("🔌 WebSocket connected")
+		wsc := &wsConn{conn: conn}
+		fmt.Printf("[WS%d] 🔌 Connected\n", wsID)
 
-		// Read Engine.IO OPEN packet (type 0)
-		msg, _, err := wsc.read()
+		// Engine.IO OPEN
+		payload, op, err := readFrame(conn)
 		if err != nil {
-			fmt.Println("Failed to read OPEN:", err)
-			wsc.conn.Close()
+			conn.Close()
 			continue
 		}
 
-		if len(msg) == 0 || msg[0] != '0' {
-			fmt.Println("Expected OPEN packet, got:", string(msg))
-			wsc.conn.Close()
+		if op == ws.OpClose {
+			code, reason := parseCloseReason(payload)
+			fmt.Printf("[WS%d] ❌ Closed: %d %s\n", wsID, code, reason)
+			conn.Close()
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		// Parse ping interval from OPEN packet
-		var openData eioOpen
-		if err := json.Unmarshal(msg[1:], &openData); err != nil {
-			fmt.Println("Failed to parse OPEN:", err)
-			wsc.conn.Close()
+		// Socket.IO connect
+		wsc.writeText([]byte("40"))
+
+		payload, op, err = readFrame(conn)
+		if err != nil || op == ws.OpClose {
+			conn.Close()
 			continue
 		}
 
-		pingInterval := time.Duration(openData.PingInterval) * time.Millisecond
-		pingTimeout := time.Duration(openData.PingTimeout) * time.Millisecond
-		fmt.Printf("📡 EIO: pingInterval=%v, pingTimeout=%v\n", pingInterval, pingTimeout)
+		// Subscribe
+		time.Sleep(50 * time.Millisecond)
+		wsc.writeText([]byte(`42["list:initialize"]`))
+		time.Sleep(50 * time.Millisecond)
+		wsc.writeText([]byte(`42["list:snapshot",[]]`))
 
-		// Socket.IO connect (namespace /)
-		if err := wsc.write([]byte("40")); err != nil {
-			wsc.conn.Close()
-			continue
-		}
+		fmt.Printf("[WS%d] 🚀 Active\n", wsID)
 
-		// Read Socket.IO ACK
-		msg, _, err = wsc.read()
-		if err != nil {
-			fmt.Println("Failed to read SIO ACK:", err)
-			wsc.conn.Close()
-			continue
-		}
-		fmt.Println("📡 SIO ACK:", string(msg))
-
-		// Subscribe to list
-		wsc.write([]byte(`42["list:initialize"]`))
-		wsc.write([]byte(`42["list:snapshot",[]]`))
-
-		fmt.Println("🚀 FAST MODE ACTIVE")
-
-		// Ping sender goroutine - uses server's pingInterval
-		stopPing := make(chan struct{})
-		go func() {
-			// Send ping slightly before the interval to be safe
-			ticker := time.NewTicker(pingInterval - 500*time.Millisecond)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					if err := wsc.write([]byte("2")); err != nil {
-						return
-					}
-				case <-stopPing:
-					return
-				}
-			}
-		}()
-
-		// Set read deadline based on ping timeout
-		wsc.conn.SetReadDeadline(time.Now().Add(pingInterval + pingTimeout))
-
-		// Main read loop
+		// Main loop
 		for {
-			msg, opcode, err := wsc.read()
+			payload, op, err := readFrame(conn)
 			wsTime := time.Now()
 
 			if err != nil {
-				fmt.Println("WS read error:", err)
+				fmt.Printf("[WS%d] Read error: %v\n", wsID, err)
 				break
 			}
 
-			// Reset deadline on any message
-			wsc.conn.SetReadDeadline(time.Now().Add(pingInterval + pingTimeout))
-
-			// Skip binary/close frames
-			if opcode != ws.OpText {
-				continue
-			}
-
-			if len(msg) == 0 {
-				continue
-			}
-
-			// Engine.IO message types:
-			// 2 = ping (server asks us to respond)
-			// 3 = pong (response to our ping)
-			// 4 = message (Socket.IO)
-
-			switch msg[0] {
-			case '2': // Server PING -> respond with PONG immediately
-				wsc.write([]byte("3"))
-				continue
-
-			case '3': // Server PONG (response to our ping)
-				continue
-
-			case '4': // Socket.IO message
-				if len(msg) > 1 && msg[1] == '2' {
-					// Event message 42[...]
-					msgCopy := make([]byte, len(msg)-2)
-					copy(msgCopy, msg[2:])
-					go speculativeParse(msgCopy, wsTime, minCents)
+			switch op {
+			case ws.OpText:
+				if len(payload) == 1 && payload[0] == '2' {
+					wsc.writeText([]byte("3"))
+					continue
 				}
+
+				if len(payload) == 1 && payload[0] == '3' {
+					continue
+				}
+
+				if len(payload) > 2 && payload[0] == '4' && payload[1] == '2' {
+					msgCopy := make([]byte, len(payload)-2)
+					copy(msgCopy, payload[2:])
+					go speculativeParse(msgCopy, wsTime, wsID, minCents)
+				}
+
+			case ws.OpPing:
+				frame := ws.NewPongFrame(payload)
+				frame = ws.MaskFrameInPlace(frame)
+				ws.WriteFrame(conn, frame)
+
+			case ws.OpClose:
+				goto reconnect
 			}
 		}
 
-		close(stopPing)
-		wsc.conn.Close()
-		fmt.Println("🔄 Reconnecting in 1s...")
-		time.Sleep(1 * time.Second)
+	reconnect:
+		conn.Close()
+		fmt.Printf("[WS%d] 🔄 Reconnecting...\n", wsID)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -535,44 +613,42 @@ func runWebSocket(cookie string, minCents int64) {
 func main() {
 	in := bufio.NewReader(os.Stdin)
 
-	fmt.Print("Enter access_token cookie (format: access_token=...):\n> ")
+	fmt.Println("╔═══════════════════════════════════════════╗")
+	fmt.Println("║     P2C SNIPER - 5 WebSocket Edition      ║")
+	fmt.Println("╚═══════════════════════════════════════════╝")
+	fmt.Println()
+
+	fmt.Print("access_token cookie:\n> ")
 	accessCookie, _ := in.ReadString('\n')
 	accessCookie = strings.TrimSpace(accessCookie)
 
 	if accessCookie == "" || !strings.HasPrefix(accessCookie, "access_token=") {
-		fmt.Println("Invalid cookie format. Expected: access_token=...")
+		fmt.Println("Invalid format")
 		return
 	}
 
 	accessCookieGlobal = accessCookie
-	cookieHeader = []byte("Cookie: " + accessCookie + "\r\n")
 
-	fmt.Print("Enter MIN in_amount (e.g. 300). 0 = no filter:\n> ")
+	fmt.Print("MIN amount (0 = no filter):\n> ")
 	minLine, _ := in.ReadString('\n')
 	minLine = strings.TrimSpace(minLine)
 
 	minCents := int64(0)
 	if minLine != "" {
-		f, err := strconv.ParseFloat(minLine, 64)
-		if err != nil {
-			fmt.Println("Bad MIN amount")
-			return
-		}
+		f, _ := strconv.ParseFloat(minLine, 64)
 		minCents = int64(f * 100)
 	}
 
-	fmt.Println("⏳ Initializing", numClients, "HTTP clients...")
+	fmt.Println()
+	fmt.Printf("⏳ Connecting %d HTTP clients...\n", numClients)
 
-	var wg sync.WaitGroup
 	for i := 0; i < numClients; i++ {
 		clients[i] = newHTTPClient(fmt.Sprintf("C%02d", i+1))
-		wg.Add(1)
-		go func(c *httpClient) {
-			defer wg.Done()
-			c.connect()
-		}(clients[i])
+		if err := clients[i].connect(); err == nil {
+			clients[i].warmup()
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	wg.Wait()
 
 	ready := 0
 	for i := 0; i < numClients; i++ {
@@ -580,21 +656,44 @@ func main() {
 			ready++
 		}
 	}
-	fmt.Printf("✅ %d/%d clients ready\n", ready, numClients)
+	fmt.Printf("✅ %d/%d HTTP clients ready\n", ready, numClients)
 
-	// Keep-alive goroutine
+	// Warmup goroutine
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
+		idx := 0
 		for range ticker.C {
-			for i := 0; i < numClients; i++ {
-				c := clients[i]
-				if !c.ready.Load() || c.conn == nil {
-					go c.reconnect()
+			c := clients[idx%numClients]
+			idx++
+
+			if !c.ready.Load() {
+				go c.connect()
+				continue
+			}
+
+			if time.Since(c.lastUsed) > 10*time.Second {
+				if err := c.warmup(); err != nil {
+					c.ready.Store(false)
+					go c.connect()
 				}
 			}
 		}
 	}()
 
-	runWebSocket(accessCookie, minCents)
+	fmt.Println()
+	fmt.Printf("⏳ Starting %d WebSockets...\n", numWebSockets)
+
+	var wsWg sync.WaitGroup
+	for i := 1; i <= numWebSockets; i++ {
+		wsWg.Add(1)
+		go runWebSocket(i, accessCookie, minCents, &wsWg)
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════")
+	fmt.Println()
+
+	wsWg.Wait()
 }

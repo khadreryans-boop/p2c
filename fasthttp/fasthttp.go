@@ -2,158 +2,281 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/valyala/fasthttp"
-	"github.com/valyala/fastjson"
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
 )
 
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 OPR/126.0.0.0"
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 const (
-	host          = "app.send.tg"
-	wsURL         = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
-	origin        = "https://app.send.tg"
-	referer       = "https://app.send.tg/p2c/orders"
-	pauseSeconds  = 20
-	numClients    = 20
-	topSlotsCount = 4
+	host           = "app.send.tg"
+	wsPath         = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
+	takePathPrefix = "/internal/v1/p2c/payments/take/"
+	origin         = "https://app.send.tg"
+	referer        = "https://app.send.tg/p2c/orders"
+	pauseSeconds   = 20
 )
 
-// Предкомпилированные константы (избегаем аллокаций)
-var (
-	takeURLBase     = []byte("https://" + host + "/internal/v1/p2c/payments/take/")
-	emptyJSONBody   = []byte(`{}`)
-	hostBytes       = []byte(host)
-	uaBytes         = []byte(UA)
-	acceptJSON      = []byte("application/json")
-	contentTypeJSON = []byte("application/json")
-	originBytes     = []byte(origin)
-	refererBytes    = []byte(referer)
-
-	// Socket.IO
-	pongMsg     = []byte("3")
-	initMsg     = []byte(`42["list:initialize"]`)
-	snapshotMsg = []byte(`42["list:snapshot",[]]`)
-	connectMsg  = []byte("40")
-)
+const numClients = 40
+const numWebSockets = 5
 
 var (
 	pauseTaking atomic.Bool
-
-	// Cookie для take запросов (глобально)
-	cookieBytes []byte
+	seenOrders  sync.Map
 )
+
+// ============ Order Event для дедупликации с таймингами ============
 
 type orderEvent struct {
-	id     string
-	wsTime time.Time
-	amtStr string
+	id      string
+	amtStr  string
+	wsID    int
+	wsTime  time.Time
+	handled atomic.Bool
 }
 
-// sync.Pool для переиспользования orderEvent
-var orderEventPool = sync.Pool{
-	New: func() interface{} {
-		return &orderEvent{}
-	},
-}
-
-// Каждая горутина имеет свой парсер (избегаем блокировок)
-var parserPool = sync.Pool{
-	New: func() interface{} {
-		return &fastjson.Parser{}
-	},
-}
-
-type clientSlot struct {
-	name   string
-	client *fasthttp.Client
-
-	// EWMA RTT (микросекунды) - упакован для cache line
-	ewmaUs  atomic.Uint64
-	samples atomic.Uint64
-	_pad    [40]byte // padding до 64 байт (cache line)
-}
-
-// Кешированный топ слотов - lockless через atomic
-var topSlotIndexes atomic.Value // []int
-
-var slots [numClients]*clientSlot
-
-const (
-	aNumer = 2
-	aDenom = 10
+var (
+	pendingOrders sync.Map // id -> *orderEvent
 )
 
-func init() {
-	// Максимизируем использование CPU
-	runtime.GOMAXPROCS(runtime.NumCPU())
+// ============ HTTP Client Pool ============
 
-	// Инициализируем дефолтные индексы
-	topSlotIndexes.Store([]int{0, 1, 2, 3})
+type httpClient struct {
+	conn   net.Conn
+	br     *bufio.Reader
+	bw     *bufio.Writer
+	mu     sync.Mutex
+	ready  atomic.Bool
+	ewmaUs atomic.Uint64
+	name   string
 }
 
-// Обновляем кеш топ-слотов каждые 100ms (lockless)
-func startTopCacheUpdater() {
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+var (
+	clients            [numClients]*httpClient
+	accessCookieGlobal string
+	cookieHeader       []byte
+)
 
-		type sv struct {
-			idx int
-			us  uint64
+func newHTTPClient(name string) *httpClient {
+	c := &httpClient{name: name}
+	c.ready.Store(false)
+	c.ewmaUs.Store(15000)
+	return c
+}
+
+func (c *httpClient) connect() error {
+	dialer := &net.Dialer{
+		Timeout:   2 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: false,
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	conn, err := tls.DialWithDialer(dialer, "tcp", host+":443", tlsConfig)
+	if err != nil {
+		return err
+	}
+
+	// SetNoDelay
+	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
+
+	c.conn = conn
+	c.br = bufio.NewReaderSize(conn, 4096)
+	c.bw = bufio.NewWriterSize(conn, 4096)
+	c.ready.Store(true)
+	return nil
+}
+
+func (c *httpClient) reconnect() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.ready.Store(false)
+
+	for i := 0; i < 3; i++ {
+		if err := c.connect(); err == nil {
+			return
 		}
-		buf := make([]sv, numClients)
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 
-		for range ticker.C {
-			for i := 0; i < numClients; i++ {
-				buf[i].idx = i
-				us := slots[i].ewmaUs.Load()
-				if us == 0 {
-					us = 9_000_000_000
-				}
-				buf[i].us = us
-			}
+var takeReqTemplate = []byte("POST " + takePathPrefix)
+var takeReqSuffix = []byte(` HTTP/1.1
+Host: app.send.tg
+Content-Type: application/json
+Accept: application/json
+Origin: https://app.send.tg
+Referer: https://app.send.tg/p2c/orders
+Content-Length: 2
+Connection: keep-alive
+User-Agent: ` + UA + `
+`)
 
-			// Частичная сортировка топ-4
-			for i := 0; i < topSlotsCount; i++ {
-				minIdx := i
-				for j := i + 1; j < numClients; j++ {
-					if buf[j].us < buf[minIdx].us {
-						minIdx = j
-					}
-				}
-				buf[i], buf[minIdx] = buf[minIdx], buf[i]
-			}
+func (c *httpClient) doTake(orderID string) (int, time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-			// Atomic store новых индексов
-			newIndexes := make([]int, topSlotsCount)
-			for i := 0; i < topSlotsCount; i++ {
-				newIndexes[i] = buf[i].idx
-			}
-			topSlotIndexes.Store(newIndexes)
+	if c.conn == nil {
+		c.reconnect()
+		if c.conn == nil {
+			return 0, 0
 		}
-	}()
+	}
+
+	_ = c.conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	c.bw.Write(takeReqTemplate)
+	c.bw.WriteString(orderID)
+	c.bw.Write(takeReqSuffix)
+	c.bw.Write(cookieHeader)
+	c.bw.WriteString("\r\n{}")
+
+	start := time.Now()
+	if err := c.bw.Flush(); err != nil {
+		c.reconnect()
+		return 0, 0
+	}
+
+	line, err := c.br.ReadString('\n')
+	dur := time.Since(start)
+
+	if err != nil {
+		c.reconnect()
+		return 0, dur
+	}
+
+	if len(line) < 12 {
+		c.reconnect()
+		return 0, dur
+	}
+	code, _ := strconv.Atoi(line[9:12])
+
+	// drain headers
+	for {
+		line, err := c.br.ReadString('\n')
+		if err != nil || line == "\r\n" {
+			break
+		}
+	}
+	// drain body
+	body := make([]byte, 512)
+	c.br.Read(body)
+
+	return code, dur
 }
 
-// Быстрое получение топ-слотов (lockless)
-func getTopSlotIndexes() []int {
-	return topSlotIndexes.Load().([]int)
+func pickBestClient() *httpClient {
+	var best *httpClient
+	bestUs := uint64(1 << 62)
+
+	for i := 0; i < numClients; i++ {
+		c := clients[i]
+		if !c.ready.Load() {
+			continue
+		}
+		us := c.ewmaUs.Load()
+		if us < bestUs {
+			bestUs = us
+			best = c
+		}
+	}
+
+	if best == nil {
+		for i := 0; i < numClients; i++ {
+			if clients[i].conn != nil {
+				return clients[i]
+			}
+		}
+	}
+	return best
 }
 
-// Оптимизированный парсинг decimal -> cents
-// Без аллокаций, inline-friendly
-func parseDecimalToCents(s string) (cents int64, ok bool) {
+func updateEWMA(old, x uint64) uint64 {
+	if old == 0 {
+		return x
+	}
+	return (old*8 + x*2) / 10
+}
+
+// ============ Ultra-fast Take ============
+
+func ultraFastTake(ev *orderEvent) {
+	if pauseTaking.Load() {
+		return
+	}
+
+	// Только первый WS обрабатывает
+	if !ev.handled.CompareAndSwap(false, true) {
+		return
+	}
+
+	client := pickBestClient()
+	if client == nil {
+		fmt.Printf("❌ NO CLIENT for %s\n", ev.id)
+		return
+	}
+
+	client.ready.Store(false)
+	code, dur := client.doTake(ev.id)
+	client.ready.Store(true)
+
+	us := uint64(dur.Microseconds())
+	if code == 0 {
+		us = 2_000_000
+	}
+	old := client.ewmaUs.Load()
+	client.ewmaUs.Store(updateEWMA(old, us))
+
+	rttMs := dur.Milliseconds()
+	e2eMs := time.Since(ev.wsTime).Milliseconds()
+
+	if code == 200 {
+		fmt.Printf("✅ TAKEN [WS%d] %s rtt=%dms e2e=%dms id=%s amt=%s\n",
+			ev.wsID, client.name, rttMs, e2eMs, ev.id, ev.amtStr)
+
+		pauseTaking.Store(true)
+		go func() {
+			time.Sleep(pauseSeconds * time.Second)
+			pauseTaking.Store(false)
+		}()
+		return
+	}
+
+	if code == 400 || code == 404 || code == 409 {
+		fmt.Printf("LATE [WS%d] %s HTTP=%d rtt=%dms e2e=%dms id=%s\n",
+			ev.wsID, client.name, code, rttMs, e2eMs, ev.id)
+		return
+	}
+
+	if code != 0 {
+		fmt.Printf("ERR [WS%d] %s HTTP=%d rtt=%dms id=%s\n",
+			ev.wsID, client.name, code, rttMs, ev.id)
+	}
+}
+
+// ============ Speculative Parser ============
+
+func parseDecimalToCents(s string) (int64, bool) {
 	if len(s) == 0 {
 		return 0, false
 	}
@@ -164,306 +287,270 @@ func parseDecimalToCents(s string) (cents int64, ok bool) {
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		switch {
-		case c == '.':
+		if c == '.' {
 			if seenDot {
 				return 0, false
 			}
 			seenDot = true
-		case c >= '0' && c <= '9':
-			d := int64(c - '0')
-			if !seenDot {
-				whole = whole*10 + d
-			} else if fracDigits < 2 {
-				frac = frac*10 + d
-				fracDigits++
-			}
-		default:
+			continue
+		}
+		if c < '0' || c > '9' {
 			return 0, false
+		}
+		d := int64(c - '0')
+		if !seenDot {
+			whole = whole*10 + d
+		} else if fracDigits < 2 {
+			frac = frac*10 + d
+			fracDigits++
 		}
 	}
 
-	// Нормализация дробной части
-	switch fracDigits {
-	case 0:
-		frac = 0
-	case 1:
+	if fracDigits == 1 {
 		frac *= 10
 	}
-
 	return whole*100 + frac, true
 }
 
-func makeFastClient() *fasthttp.Client {
-	dialer := &net.Dialer{
-		Timeout:   300 * time.Millisecond,
-		KeepAlive: 30 * time.Second,
-	}
+var (
+	opAddBytes     = []byte(`"op":"add"`)
+	idPrefixBytes  = []byte(`"id":"`)
+	amtPrefixBytes = []byte(`"in_amount":"`)
+)
 
-	return &fasthttp.Client{
-		Name:                          UA,
-		ReadTimeout:                   500 * time.Millisecond,
-		WriteTimeout:                  500 * time.Millisecond,
-		MaxConnsPerHost:               256,
-		MaxIdleConnDuration:           90 * time.Second,
-		MaxConnWaitTimeout:            20 * time.Millisecond,
-		DisableHeaderNamesNormalizing: true,
-		DisablePathNormalizing:        true,
-		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: host,
-		},
-		Dial: func(addr string) (net.Conn, error) {
-			conn, err := dialer.Dial("tcp", addr)
-			if err != nil {
-				return nil, err
-			}
-			if tc, ok := conn.(*net.TCPConn); ok {
-				tc.SetNoDelay(true)
-				tc.SetLinger(0)
-			}
-			return conn, nil
-		},
-	}
-}
-
-func warmupSlot(slot *clientSlot) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI("https://" + host + "/p2c/orders")
-	req.Header.SetMethodBytes([]byte("GET"))
-	req.Header.SetBytesV("User-Agent", uaBytes)
-
-	t0 := time.Now()
-	err := slot.client.DoTimeout(req, resp, 1500*time.Millisecond)
-	dur := time.Since(t0)
-
-	us := uint64(dur.Microseconds())
-	if err != nil {
-		us = 2_000_000
-	}
-
-	updateEWMA(&slot.ewmaUs, us)
-	slot.samples.Add(1)
-}
-
-// Inline EWMA update
-func updateEWMA(ewma *atomic.Uint64, newUs uint64) {
-	for {
-		old := ewma.Load()
-		var newVal uint64
-		if old == 0 {
-			newVal = newUs
-		} else {
-			newVal = (old*(aDenom-aNumer) + newUs*aNumer) / aDenom
-		}
-		if ewma.CompareAndSwap(old, newVal) {
-			return
-		}
-		// CAS failed, retry
-	}
-}
-
-func doTakeOnce(client *fasthttp.Client, cookieBytes []byte, id string) (code int, dur time.Duration, err error) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	// Строим URL без аллокаций где возможно
-	urlBuf := make([]byte, 0, len(takeURLBase)+len(id))
-	urlBuf = append(urlBuf, takeURLBase...)
-	urlBuf = append(urlBuf, id...)
-
-	req.SetRequestURIBytes(urlBuf)
-	req.Header.SetMethodBytes([]byte("POST"))
-	req.Header.SetHostBytes(hostBytes)
-	req.Header.SetBytesV("User-Agent", uaBytes)
-	req.Header.SetBytesKV([]byte("Accept"), acceptJSON)
-	req.Header.SetBytesKV([]byte("Content-Type"), contentTypeJSON)
-	req.Header.SetBytesKV([]byte("Origin"), originBytes)
-	req.Header.SetBytesKV([]byte("Referer"), refererBytes)
-	req.Header.SetBytesKV([]byte("Cookie"), cookieBytes)
-	req.SetBodyRaw(emptyJSONBody)
-
-	t0 := time.Now()
-	err = client.DoRedirects(req, resp, 5)
-	dur = time.Since(t0)
-
-	if err != nil {
-		return 0, dur, err
-	}
-	return resp.StatusCode(), dur, nil
-}
-
-func takeOrderFast(slot *clientSlot, cookieBytes []byte, ev *orderEvent, ewmaAtPickUs uint64) {
-	if pauseTaking.Load() {
-		orderEventPool.Put(ev)
+func speculativeParse(msg []byte, wsTime time.Time, wsID int, minCents int64) {
+	if !bytes.Contains(msg, opAddBytes) {
 		return
 	}
 
-	code, dur, err := doTakeOnce(slot.client, cookieBytes, ev.id)
-
-	rttUs := dur.Microseconds()
-	e2eUs := time.Since(ev.wsTime).Microseconds()
-
-	// Обновляем EWMA
-	us := uint64(rttUs)
-	if err != nil {
-		us = 2_000_000
-	}
-	updateEWMA(&slot.ewmaUs, us)
-	slot.samples.Add(1)
-
-	preMs := e2eUs/1000 - rttUs/1000
-	rttMs := rttUs / 1000
-	e2eMs := e2eUs / 1000
-
-	if err != nil {
-		fmt.Printf("✗ %s err pre=%dms rtt=%dms id=%s\n", slot.name, preMs, rttMs, ev.id[:12])
-		orderEventPool.Put(ev)
+	idIdx := bytes.Index(msg, idPrefixBytes)
+	if idIdx == -1 {
 		return
 	}
-
-	switch code {
-	case 200:
-		fmt.Printf("✓ OK %s e2e=%dms id=%s\n", slot.name, e2eMs, ev.id)
-		pauseTaking.Store(true)
-		go func() {
-			time.Sleep(pauseSeconds * time.Second)
-			pauseTaking.Store(false)
-		}()
-	case 400:
-		fmt.Printf("✗ %s 400 pre=%dms rtt=%dms e2e=%dms\n", slot.name, preMs, rttMs, e2eMs)
-	default:
-		fmt.Printf("✗ %s %d pre=%dms rtt=%dms e2e=%dms\n", slot.name, code, preMs, rttMs, e2eMs)
-	}
-
-	orderEventPool.Put(ev)
-}
-
-func handleSocketIOMessage(parser *fastjson.Parser, minCents int64, baseTime time.Time, msg string) {
-	// Быстрый выход для ping/pong
-	if len(msg) < 50 || msg[0] != '4' || msg[1] != '2' {
+	idStart := idIdx + 6
+	idEnd := bytes.IndexByte(msg[idStart:], '"')
+	if idEnd == -1 || idEnd > 30 {
 		return
 	}
+	id := string(msg[idStart : idStart+idEnd])
 
-	// Ищем "op":"add" - если нет, выходим
-	if !strings.Contains(msg, `"op":"add"`) {
-		return
-	}
-
-	if pauseTaking.Load() {
-		return
-	}
-
-	// Быстрый поиск id после "op":"add"
-	// Формат: ..."id":"6983cf2dc79a7ad174193fc6"...
-	idStart := strings.Index(msg, `"id":"`)
-	if idStart == -1 {
-		return
-	}
-	idStart += 6 // длина `"id":"`
-	idEnd := strings.IndexByte(msg[idStart:], '"')
-	if idEnd == -1 || idEnd < 20 {
-		return
-	}
-	id := msg[idStart : idStart+idEnd]
-
-	// Быстрый поиск in_amount
 	var amtStr string
-	amtStart := strings.Index(msg, `"in_amount":"`)
-	if amtStart != -1 {
-		amtStart += 13
-		amtEnd := strings.IndexByte(msg[amtStart:], '"')
-		if amtEnd > 0 {
-			amtStr = msg[amtStart : amtStart+amtEnd]
+	amtIdx := bytes.Index(msg, amtPrefixBytes)
+	if amtIdx != -1 {
+		amtStart := amtIdx + 13
+		amtEnd := bytes.IndexByte(msg[amtStart:], '"')
+		if amtEnd != -1 && amtEnd < 20 {
+			amtStr = string(msg[amtStart : amtStart+amtEnd])
 		}
 	}
 
-	// Фильтр по сумме
-	if minCents > 0 {
+	if minCents > 0 && amtStr != "" {
 		cents, ok := parseDecimalToCents(amtStr)
 		if !ok || cents < minCents {
 			return
 		}
 	}
 
-	// Выбираем топ-2 клиента по EWMA (минимальный RTT)
-	var best1, best2 *clientSlot
-	var min1, min2 uint64 = ^uint64(0), ^uint64(0)
-
-	for i := 0; i < numClients; i++ {
-		s := slots[i]
-		ewma := s.ewmaUs.Load()
-		if ewma == 0 {
-			ewma = 9_000_000_000
-		}
-		if ewma < min1 {
-			min2, best2 = min1, best1
-			min1, best1 = ewma, s
-		} else if ewma < min2 {
-			min2, best2 = ewma, s
-		}
+	// Проверяем, видели ли уже этот ордер
+	ev := &orderEvent{
+		id:     id,
+		amtStr: amtStr,
+		wsID:   wsID,
+		wsTime: wsTime,
 	}
 
-	fmt.Printf("ORDER %s amt=%s → %s(%.1fms) %s(%.1fms)\n",
-		id[:12], amtStr,
-		best1.name, float64(min1)/1000.0,
-		best2.name, float64(min2)/1000.0)
-
-	// Отправляем take на лучших клиентов
-	if best1 != nil {
-		ev := orderEventPool.Get().(*orderEvent)
-		ev.id = id
-		ev.wsTime = baseTime
-		ev.amtStr = amtStr
-		go takeOrderFast(best1, cookieBytes, ev, min1)
+	existing, loaded := pendingOrders.LoadOrStore(id, ev)
+	if loaded {
+		// Уже видели - логируем задержку между WS
+		existingEv := existing.(*orderEvent)
+		delay := wsTime.Sub(existingEv.wsTime)
+		fmt.Printf("   ├─ [WS%d] DUPLICATE id=%s (WS%d was first by %v)\n",
+			wsID, id, existingEv.wsID, delay)
+		return
 	}
-	if best2 != nil {
-		ev := orderEventPool.Get().(*orderEvent)
-		ev.id = id
-		ev.wsTime = baseTime
-		ev.amtStr = amtStr
-		go takeOrderFast(best2, cookieBytes, ev, min2)
+
+	// Первый WS увидел этот ордер
+	fmt.Printf("📥 [WS%d] NEW: %s amt=%s\n", wsID, id, amtStr)
+	go ultraFastTake(ev)
+
+	// Cleanup через 5 секунд
+	go func() {
+		time.Sleep(5 * time.Second)
+		pendingOrders.Delete(id)
+	}()
+}
+
+// ============ WebSocket (gobwas/ws) ============
+
+type wsConn struct {
+	conn     net.Conn
+	id       int
+	cookie   string
+	minCents int64
+}
+
+func connectWebSocket(cookie string, wsID int) (net.Conn, error) {
+	dialer := ws.Dialer{
+		Header: ws.HandshakeHeaderHTTP(http.Header{
+			"Host":            []string{host},
+			"Origin":          []string{origin},
+			"User-Agent":      []string{UA},
+			"Cookie":          []string{cookie},
+			"Pragma":          []string{"no-cache"},
+			"Cache-Control":   []string{"no-cache"},
+			"Accept-Language": []string{"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
+		}),
+		Timeout: 10 * time.Second,
+		NetDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			conn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+				_ = tc.SetKeepAlive(true)
+				_ = tc.SetKeepAlivePeriod(30 * time.Second)
+			}
+			return conn, nil
+		},
+		TLSConfig: &tls.Config{
+			ServerName: host,
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+
+	conn, _, _, err := dialer.Dial(context.Background(), "wss://"+host+wsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func wsWrite(conn net.Conn, msg []byte) error {
+	return wsutil.WriteClientText(conn, msg)
+}
+
+func wsRead(conn net.Conn) ([]byte, error) {
+	return wsutil.ReadServerText(conn)
+}
+
+func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	reconnectDelay := 1 * time.Second
+
+	for {
+		conn, err := connectWebSocket(cookie, wsID)
+		if err != nil {
+			fmt.Printf("[WS%d] Connect error: %v\n", wsID, err)
+			time.Sleep(reconnectDelay)
+			continue
+		}
+
+		fmt.Printf("[WS%d] 🔌 Connected\n", wsID)
+		reconnectDelay = 1 * time.Second
+
+		// Engine.IO OPEN
+		msg, err := wsRead(conn)
+		if err != nil {
+			fmt.Printf("[WS%d] Read OPEN error: %v\n", wsID, err)
+			conn.Close()
+			continue
+		}
+		_ = msg
+
+		// Socket.IO connect
+		if err := wsWrite(conn, []byte("40")); err != nil {
+			conn.Close()
+			continue
+		}
+
+		// ACK
+		msg, err = wsRead(conn)
+		if err != nil {
+			fmt.Printf("[WS%d] Read ACK error: %v\n", wsID, err)
+			conn.Close()
+			continue
+		}
+		_ = msg
+
+		// Subscribe
+		wsWrite(conn, []byte(`42["list:initialize"]`))
+		wsWrite(conn, []byte(`42["list:snapshot",[]]`))
+
+		fmt.Printf("[WS%d] 🚀 Active\n", wsID)
+
+		// Ping goroutine
+		stopPing := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(20 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := wsWrite(conn, []byte("2")); err != nil {
+						return
+					}
+				case <-stopPing:
+					return
+				}
+			}
+		}()
+
+		// Main read loop
+		for {
+			msg, err := wsRead(conn)
+			wsTime := time.Now()
+
+			if err != nil {
+				fmt.Printf("[WS%d] Read error: %v\n", wsID, err)
+				break
+			}
+
+			// Engine.IO ping
+			if len(msg) == 1 && msg[0] == '2' {
+				wsWrite(conn, []byte("3"))
+				continue
+			}
+
+			// Socket.IO message
+			if len(msg) > 2 && msg[0] == '4' && msg[1] == '2' {
+				msgCopy := make([]byte, len(msg)-2)
+				copy(msgCopy, msg[2:])
+				go speculativeParse(msgCopy, wsTime, wsID, minCents)
+			}
+		}
+
+		close(stopPing)
+		conn.Close()
+		fmt.Printf("[WS%d] 🔄 Reconnecting...\n", wsID)
+		time.Sleep(reconnectDelay)
 	}
 }
 
-func splitPackets(s string) []string {
-	if !strings.Contains(s, "\x1e") {
-		return []string{s}
-	}
-	parts := strings.Split(s, "\x1e")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
+// ============ Main ============
 
 func main() {
 	in := bufio.NewReader(os.Stdin)
+
+	fmt.Println("╔═══════════════════════════════════════════╗")
+	fmt.Println("║     P2C SNIPER - 5 WebSocket Edition      ║")
+	fmt.Println("╚═══════════════════════════════════════════╝")
+	fmt.Println()
 
 	fmt.Print("Enter access_token cookie (format: access_token=...):\n> ")
 	accessCookie, _ := in.ReadString('\n')
 	accessCookie = strings.TrimSpace(accessCookie)
 
-	if accessCookie == "" {
-		fmt.Println("Cookie is empty. Exit.")
-		return
-	}
-	if !strings.HasPrefix(accessCookie, "access_token=") {
-		fmt.Println("Expected format: access_token=...")
+	if accessCookie == "" || !strings.HasPrefix(accessCookie, "access_token=") {
+		fmt.Println("Invalid cookie format. Expected: access_token=...")
 		return
 	}
 
-	// Сохраняем в глобальную переменную
-	cookieBytes = []byte(accessCookie)
+	accessCookieGlobal = accessCookie
+	cookieHeader = []byte("Cookie: " + accessCookie + "\r\n")
 
 	fmt.Print("Enter MIN in_amount (e.g. 300). 0 = no filter:\n> ")
 	minLine, _ := in.ReadString('\n')
@@ -473,147 +560,67 @@ func main() {
 	if minLine != "" {
 		f, err := strconv.ParseFloat(minLine, 64)
 		if err != nil {
-			fmt.Println("Bad MIN amount, expected number. Exit.")
+			fmt.Println("Bad MIN amount")
 			return
 		}
-		minCents = int64(f * 100.0)
+		minCents = int64(f * 100)
 	}
 
-	// Инициализация клиентов
+	fmt.Println()
+	fmt.Println("⏳ Initializing", numClients, "HTTP clients...")
+
+	// Init HTTP clients
+	var httpWg sync.WaitGroup
 	for i := 0; i < numClients; i++ {
-		slots[i] = &clientSlot{
-			name:   fmt.Sprintf("C%d", i+1),
-			client: makeFastClient(),
+		clients[i] = newHTTPClient(fmt.Sprintf("C%02d", i+1))
+		httpWg.Add(1)
+		go func(c *httpClient) {
+			defer httpWg.Done()
+			c.connect()
+		}(clients[i])
+	}
+	httpWg.Wait()
+
+	ready := 0
+	for i := 0; i < numClients; i++ {
+		if clients[i].ready.Load() {
+			ready++
 		}
 	}
+	fmt.Printf("✅ %d/%d HTTP clients ready\n", ready, numClients)
 
-	startTopCacheUpdater()
-
-	// Прогрев соединений
-	fmt.Println("Warming up connections...")
-	var wg sync.WaitGroup
-	for i := 0; i < numClients; i++ {
-		wg.Add(1)
-		go func(s *clientSlot) {
-			defer wg.Done()
-			warmupSlot(s)
-		}(slots[i])
-	}
-	wg.Wait()
-	fmt.Println("Warmup complete")
-
-	// Фоновый прогрев
-	for i := 0; i < numClients; i++ {
-		s := slots[i]
-		go func() {
-			ticker := time.NewTicker(2 * time.Second)
-			for range ticker.C {
-				warmupSlot(s)
-			}
-		}()
-	}
-
-	// WebSocket
-	wsDialer := websocket.Dialer{
-		HandshakeTimeout:  6 * time.Second,
-		EnableCompression: false,
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: host,
-		},
-		NetDialContext: (&net.Dialer{
-			Timeout:   3 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	}
-
-	header := http.Header{}
-	header.Set("Host", host)
-	header.Set("Origin", origin)
-	header.Set("User-Agent", UA)
-	header.Set("Cookie", accessCookie)
-	header.Set("Pragma", "no-cache")
-	header.Set("Cache-Control", "no-cache")
-
-	ws, resp, err := wsDialer.Dial(wsURL, header)
-	if err != nil {
-		if resp != nil {
-			fmt.Println("WS dial failed, HTTP status:", resp.Status)
-		}
-		fmt.Println("WS dial err:", err)
-		return
-	}
-	defer ws.Close()
-
-	pongWait := 60 * time.Second
-	ws.SetReadLimit(1 << 20)
-	ws.SetReadDeadline(time.Now().Add(pongWait))
-
-	ws.SetPongHandler(func(string) error {
-		ws.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-	ws.SetPingHandler(func(appData string) error {
-		ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(2*time.Second))
-		ws.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-
-	stopPing := make(chan struct{})
+	// Keep-alive goroutine
 	go func() {
-		ticker := time.NewTicker(25 * time.Second)
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(2*time.Second))
-			case <-stopPing:
-				return
+		for range ticker.C {
+			for i := 0; i < numClients; i++ {
+				c := clients[i]
+				if !c.ready.Load() || c.conn == nil {
+					go c.reconnect()
+				}
 			}
 		}
 	}()
-	defer close(stopPing)
 
-	// OPEN packet
-	_, _, err = ws.ReadMessage()
-	if err != nil {
-		return
+	fmt.Println()
+	fmt.Println("⏳ Starting", numWebSockets, "WebSocket connections...")
+	fmt.Println()
+
+	// Start WebSockets
+	var wsWg sync.WaitGroup
+	for i := 1; i <= numWebSockets; i++ {
+		wsWg.Add(1)
+		go runWebSocket(i, accessCookie, minCents, &wsWg)
+		time.Sleep(200 * time.Millisecond) // stagger connections
 	}
 
-	ws.WriteMessage(websocket.TextMessage, connectMsg)
+	fmt.Println()
+	fmt.Println("════════════════════════════════════════════")
+	fmt.Println("  Watching for orders... (Ctrl+C to stop)")
+	fmt.Println("════════════════════════════════════════════")
+	fmt.Println()
 
-	// ACK
-	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, _, err = ws.ReadMessage()
-	ws.SetReadDeadline(time.Now().Add(pongWait))
-	if err != nil {
-		return
-	}
-
-	ws.WriteMessage(websocket.TextMessage, initMsg)
-	ws.WriteMessage(websocket.TextMessage, snapshotMsg)
-
-	fmt.Println("Listening for orders...")
-
-	// Получаем парсер для главной горутины
-	parser := parserPool.Get().(*fastjson.Parser)
-	defer parserPool.Put(parser)
-
-	for {
-		_, raw, err := ws.ReadMessage()
-		if err != nil {
-			fmt.Println("WS read error:", err)
-			return
-		}
-		wsNow := time.Now()
-
-		s := string(raw)
-		for _, pkt := range splitPackets(s) {
-			if pkt == "2" {
-				ws.WriteMessage(websocket.TextMessage, pongMsg)
-				continue
-			}
-			handleSocketIOMessage(parser, minCents, wsNow, pkt)
-		}
-	}
+	// Wait forever
+	wsWg.Wait()
 }
