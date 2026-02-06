@@ -28,8 +28,13 @@ const (
 	pauseSeconds   = 20
 )
 
-const numWebSockets = 20
-const parallelTakes = 5
+const (
+	numWebSockets    = 20
+	parallelTakes    = 5
+	probeConnections = 30 // Создаём 30 соединений, оставляем лучшие
+	keepBestClients  = 15 // Оставляем 15 лучших HTTP клиентов
+	probeWebSockets  = 40 // Создаём 40 WS, оставляем лучшие 20
+)
 
 var (
 	pauseTaking atomic.Bool
@@ -56,6 +61,7 @@ type httpClient struct {
 	lastUsed time.Time
 	inUse    atomic.Bool
 	lastRtt  atomic.Uint64
+	initRtt  uint64 // RTT при создании (для сортировки)
 
 	totalRequests atomic.Uint64
 	totalLatency  atomic.Uint64
@@ -161,6 +167,16 @@ func (c *httpClient) warmup() (time.Duration, error) {
 	return dur, nil
 }
 
+func (c *httpClient) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+	c.ready.Store(false)
+}
+
 func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -257,33 +273,9 @@ func getBestClients(count int) []*httpClient {
 		return avail[i].rtt < avail[j].rtt
 	})
 
-	usedIPs := make(map[string]int)
 	var result []*httpClient
-
-	for _, a := range avail {
-		if len(result) >= count {
-			break
-		}
-		if usedIPs[a.c.ip] < 2 {
-			result = append(result, a.c)
-			usedIPs[a.c.ip]++
-		}
-	}
-
-	for _, a := range avail {
-		if len(result) >= count {
-			break
-		}
-		found := false
-		for _, r := range result {
-			if r == a.c {
-				found = true
-				break
-			}
-		}
-		if !found {
-			result = append(result, a.c)
-		}
+	for i := 0; i < len(avail) && i < count; i++ {
+		result = append(result, avail[i].c)
 	}
 
 	return result
@@ -360,8 +352,7 @@ func instantTake(id, amt string, wsID int, wsTime time.Time) {
 			details = append(details, r.client.name+":ERR")
 			continue
 		}
-		ipShort := r.client.ip[strings.LastIndex(r.client.ip, ".")+1:]
-		s := fmt.Sprintf("%s[%s]:%d", r.client.name, ipShort, r.dur.Milliseconds())
+		s := fmt.Sprintf("%s:%d", r.client.name, r.dur.Milliseconds())
 		if r.code == 200 {
 			s += "✓"
 			if winner == nil {
@@ -461,8 +452,11 @@ func parse(msg []byte, wsTime time.Time, wsID int, minCents int64) {
 // ============ WebSocket ============
 
 type wsConn struct {
-	conn net.Conn
-	mu   sync.Mutex
+	conn    net.Conn
+	mu      sync.Mutex
+	ip      string
+	initRtt time.Duration
+	id      int
 }
 
 func (w *wsConn) write(msg []byte) error {
@@ -518,76 +512,84 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
-func runWS(wsID int, cookie string, ip string, minCents int64, wg *sync.WaitGroup) {
+var activeWebSockets []*wsConn
+var wsMu sync.Mutex
+
+func runWS(wsc *wsConn, cookie string, minCents int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	conn := wsc.conn
+	ipShort := wsc.ip[strings.LastIndex(wsc.ip, ".")+1:]
+
+	// Already connected, just initialize
+	wsc.write([]byte("40"))
+	p, op, err := readFrame(conn)
+	if err != nil || op == ws.OpClose {
+		conn.Close()
+		return
+	}
+	_ = p
+
+	time.Sleep(30 * time.Millisecond)
+	wsc.write([]byte(`42["list:initialize"]`))
+	time.Sleep(30 * time.Millisecond)
+	wsc.write([]byte(`42["list:snapshot",[]]`))
+
+	fmt.Printf("[WS%02d@%s] 🚀 (init=%dms)\n", wsc.id, ipShort, wsc.initRtt.Milliseconds())
+
 	for {
-		conn, err := connectWS(cookie, ip)
-		if err != nil {
-			fmt.Printf("[WS%02d@%s] err: %v\n", wsID, ip[strings.LastIndex(ip, ".")+1:], err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		wsc := &wsConn{conn: conn}
-		fmt.Printf("[WS%02d@%s] 🔌\n", wsID, ip[strings.LastIndex(ip, ".")+1:])
-
 		p, op, err := readFrame(conn)
-		if err != nil || op == ws.OpClose {
+		t := time.Now()
+
+		if err != nil {
+			fmt.Printf("[WS%02d@%s] err, reconnecting...\n", wsc.id, ipShort)
 			conn.Close()
-			continue
-		}
-		_ = p
 
-		wsc.write([]byte("40"))
-		p, op, err = readFrame(conn)
-		if err != nil || op == ws.OpClose {
-			conn.Close()
-			continue
-		}
+			// Reconnect
+			for {
+				newConn, err := connectWS(cookie, wsc.ip)
+				if err != nil {
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				wsc.conn = newConn
+				conn = newConn
 
-		time.Sleep(30 * time.Millisecond)
-		wsc.write([]byte(`42["list:initialize"]`))
-		time.Sleep(30 * time.Millisecond)
-		wsc.write([]byte(`42["list:snapshot",[]]`))
-
-		fmt.Printf("[WS%02d@%s] 🚀\n", wsID, ip[strings.LastIndex(ip, ".")+1:])
-
-		for {
-			p, op, err := readFrame(conn)
-			t := time.Now()
-
-			if err != nil {
+				// Re-init
+				wsc.write([]byte("40"))
+				readFrame(conn)
+				time.Sleep(30 * time.Millisecond)
+				wsc.write([]byte(`42["list:initialize"]`))
+				time.Sleep(30 * time.Millisecond)
+				wsc.write([]byte(`42["list:snapshot",[]]`))
+				fmt.Printf("[WS%02d@%s] 🔄 reconnected\n", wsc.id, ipShort)
 				break
 			}
-
-			switch op {
-			case ws.OpText:
-				if len(p) == 1 && p[0] == '2' {
-					wsc.write([]byte("3"))
-					continue
-				}
-				if len(p) == 1 && p[0] == '3' {
-					continue
-				}
-				if len(p) > 2 && p[0] == '4' && p[1] == '2' {
-					msg := make([]byte, len(p)-2)
-					copy(msg, p[2:])
-					go parse(msg, t, wsID, minCents)
-				}
-			case ws.OpPing:
-				f := ws.NewPongFrame(p)
-				f = ws.MaskFrameInPlace(f)
-				ws.WriteFrame(conn, f)
-			case ws.OpClose:
-				goto reconn
-			}
+			continue
 		}
 
-	reconn:
-		conn.Close()
-		fmt.Printf("[WS%02d@%s] 🔄\n", wsID, ip[strings.LastIndex(ip, ".")+1:])
-		time.Sleep(1 * time.Second)
+		switch op {
+		case ws.OpText:
+			if len(p) == 1 && p[0] == '2' {
+				wsc.write([]byte("3"))
+				continue
+			}
+			if len(p) == 1 && p[0] == '3' {
+				continue
+			}
+			if len(p) > 2 && p[0] == '4' && p[1] == '2' {
+				msg := make([]byte, len(p)-2)
+				copy(msg, p[2:])
+				go parse(msg, t, wsc.id, minCents)
+			}
+		case ws.OpPing:
+			f := ws.NewPongFrame(p)
+			f = ws.MaskFrameInPlace(f)
+			ws.WriteFrame(conn, f)
+		case ws.OpClose:
+			conn.Close()
+			return
+		}
 	}
 }
 
@@ -599,82 +601,187 @@ func parseCloseReason(p []byte) (uint16, string) {
 }
 
 func printStats() {
-	fmt.Println("\n📊 STATS by IP:")
+	fmt.Println("\n📊 STATS:")
 
-	ipData := make(map[string]struct {
-		reqs, wins       uint64
-		totalLat, minLat uint64
-		clients          int
-	})
-
+	// HTTP clients by RTT
+	type cstat struct {
+		name string
+		rtt  uint64
+		wins uint64
+		reqs uint64
+	}
+	var cstats []cstat
 	for _, c := range clients {
-		d := ipData[c.ip]
-		d.reqs += c.totalRequests.Load()
-		d.wins += c.wins.Load()
-		d.totalLat += c.totalLatency.Load()
-		min := c.minLatency.Load()
-		if min != 999999999 && (d.minLat == 0 || min < d.minLat) {
-			d.minLat = min
-		}
-		d.clients++
-		ipData[c.ip] = d
+		cstats = append(cstats, cstat{c.name, c.lastRtt.Load(), c.wins.Load(), c.totalRequests.Load()})
 	}
-
-	type ipStat struct {
-		ip      string
-		clients int
-		min     uint64
-		avg     uint64
-		reqs    uint64
-		wins    uint64
-	}
-	var stats []ipStat
-	for ip, d := range ipData {
-		avg := uint64(0)
-		if d.reqs > 0 {
-			avg = d.totalLat / d.reqs
-		}
-		stats = append(stats, ipStat{ip, d.clients, d.minLat, avg, d.reqs, d.wins})
-	}
-	sort.Slice(stats, func(i, j int) bool {
-		return stats[i].min < stats[j].min
+	sort.Slice(cstats, func(i, j int) bool {
+		return cstats[i].rtt < cstats[j].rtt
 	})
 
-	for i, s := range stats {
-		marker := ""
-		if i == 0 {
-			marker = " ⭐"
+	fmt.Println("  HTTP Clients (by RTT):")
+	for i, cs := range cstats {
+		if i >= 10 {
+			fmt.Printf("  ... and %d more\n", len(cstats)-10)
+			break
 		}
-		fmt.Printf("  %s: %d clients | min=%dms avg=%dms | reqs=%d wins=%d%s\n",
-			s.ip, s.clients, s.min, s.avg, s.reqs, s.wins, marker)
+		fmt.Printf("    %s: rtt=%dms wins=%d reqs=%d\n", cs.name, cs.rtt, cs.wins, cs.reqs)
 	}
 }
 
-// Measure IP latency
-func measureIP(ip string) time.Duration {
-	c := newHTTPClient("probe", ip)
-	if err := c.connect(); err != nil {
-		return 999 * time.Second
-	}
-	defer c.conn.Close()
+// Probe connections to find best workers
+func probeAndSelectBest(ips []string) []*httpClient {
+	fmt.Printf("\n⏳ Probing %d connections per IP to find best workers...\n", probeConnections/len(ips))
 
-	var total time.Duration
-	for i := 0; i < 3; i++ {
-		dur, err := c.warmup()
-		if err != nil {
-			return 999 * time.Second
-		}
-		total += dur
-		time.Sleep(50 * time.Millisecond)
+	var allClients []*httpClient
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	perIP := probeConnections / len(ips)
+	if perIP < 5 {
+		perIP = 5
 	}
-	return total / 3
+
+	for _, ip := range ips {
+		for i := 0; i < perIP; i++ {
+			wg.Add(1)
+			go func(ip string, idx int) {
+				defer wg.Done()
+
+				name := fmt.Sprintf("%s_%d", ip[strings.LastIndex(ip, ".")+1:], idx+1)
+				c := newHTTPClient(name, ip)
+
+				if err := c.connect(); err != nil {
+					return
+				}
+
+				// Measure RTT 3 times
+				var totalRtt time.Duration
+				for j := 0; j < 3; j++ {
+					dur, err := c.warmup()
+					if err != nil {
+						c.close()
+						return
+					}
+					totalRtt += dur
+					time.Sleep(20 * time.Millisecond)
+				}
+
+				c.initRtt = uint64(totalRtt.Milliseconds() / 3)
+				c.lastRtt.Store(c.initRtt)
+
+				mu.Lock()
+				allClients = append(allClients, c)
+				mu.Unlock()
+			}(ip, i)
+		}
+	}
+
+	wg.Wait()
+
+	// Sort by initRtt
+	sort.Slice(allClients, func(i, j int) bool {
+		return allClients[i].initRtt < allClients[j].initRtt
+	})
+
+	// Keep best, close rest
+	var best []*httpClient
+	for i, c := range allClients {
+		if i < keepBestClients {
+			best = append(best, c)
+			fmt.Printf("   ✅ %s: %dms\n", c.name, c.initRtt)
+		} else {
+			c.close()
+		}
+	}
+
+	fmt.Printf("\n✅ Kept %d best HTTP clients (from %d probed)\n", len(best), len(allClients))
+	return best
+}
+
+// Probe WebSockets to find best workers
+func probeAndSelectBestWS(ips []string, cookie string) []*wsConn {
+	fmt.Printf("\n⏳ Probing %d WebSockets to find best workers...\n", probeWebSockets)
+
+	type wsProbe struct {
+		conn net.Conn
+		ip   string
+		rtt  time.Duration
+	}
+
+	var allWS []wsProbe
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	perIP := probeWebSockets / len(ips)
+	if perIP < 5 {
+		perIP = 5
+	}
+
+	for _, ip := range ips {
+		for i := 0; i < perIP; i++ {
+			wg.Add(1)
+			go func(ip string) {
+				defer wg.Done()
+
+				start := time.Now()
+				conn, err := connectWS(cookie, ip)
+				rtt := time.Since(start)
+
+				if err != nil {
+					return
+				}
+
+				// Read OPEN packet to verify connection
+				p, op, err := readFrame(conn)
+				if err != nil || op == ws.OpClose {
+					conn.Close()
+					return
+				}
+				_ = p
+
+				mu.Lock()
+				allWS = append(allWS, wsProbe{conn, ip, rtt})
+				mu.Unlock()
+			}(ip)
+
+			time.Sleep(30 * time.Millisecond)
+		}
+	}
+
+	wg.Wait()
+
+	// Sort by RTT
+	sort.Slice(allWS, func(i, j int) bool {
+		return allWS[i].rtt < allWS[j].rtt
+	})
+
+	// Keep best, close rest
+	var best []*wsConn
+	for i, w := range allWS {
+		if i < numWebSockets {
+			wsc := &wsConn{
+				conn:    w.conn,
+				ip:      w.ip,
+				initRtt: w.rtt,
+				id:      i + 1,
+			}
+			best = append(best, wsc)
+			ipShort := w.ip[strings.LastIndex(w.ip, ".")+1:]
+			fmt.Printf("   ✅ WS%02d@%s: %dms\n", i+1, ipShort, w.rtt.Milliseconds())
+		} else {
+			w.conn.Close()
+		}
+	}
+
+	fmt.Printf("\n✅ Kept %d best WebSockets (from %d probed)\n", len(best), len(allWS))
+	return best
 }
 
 func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - Smart IP Allocation         ║")
+	fmt.Println("║  P2C SNIPER - Worker Discovery            ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -702,43 +809,8 @@ func main() {
 	}
 
 	popIPs = ips
-	fmt.Printf("✅ Found %d POP IPs\n", len(popIPs))
+	fmt.Printf("✅ Found %d POP IPs: %v\n", len(popIPs), popIPs)
 
-	// Measure latency to each IP
-	fmt.Println("\n⏳ Measuring latency to each POP...")
-	type ipLatency struct {
-		ip  string
-		lat time.Duration
-	}
-	var latencies []ipLatency
-
-	for _, ip := range popIPs {
-		lat := measureIP(ip)
-		latencies = append(latencies, ipLatency{ip, lat})
-		fmt.Printf("   %s: %dms\n", ip, lat.Milliseconds())
-	}
-
-	// Sort by latency (best first)
-	sort.Slice(latencies, func(i, j int) bool {
-		return latencies[i].lat < latencies[j].lat
-	})
-
-	// Allocate clients: more on faster IPs
-	// Best: 7 clients, Middle: 5 clients, Worst: 3 clients
-	clientCounts := []int{7, 5, 3}
-	if len(latencies) > 3 {
-		// If more than 3 IPs, distribute evenly with bonus to best
-		clientCounts = make([]int, len(latencies))
-		for i := range clientCounts {
-			clientCounts[i] = 3
-		}
-		clientCounts[0] = 6
-		if len(clientCounts) > 1 {
-			clientCounts[1] = 5
-		}
-	}
-
-	fmt.Println("\n📊 Client allocation (sorted by latency):")
 	reqPrefix = []byte("POST " + takePathPrefix)
 	reqSuffix = []byte(" HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -747,50 +819,13 @@ func main() {
 		"Content-Length: 2\r\n" +
 		"\r\n{}")
 
-	totalClients := 0
-	for i, il := range latencies {
-		count := 3
-		if i < len(clientCounts) {
-			count = clientCounts[i]
-		}
+	// Probe HTTP connections and keep best
+	clients = probeAndSelectBest(popIPs)
 
-		marker := ""
-		if i == 0 {
-			marker = " ⭐ BEST"
-		}
-		fmt.Printf("   %s: %d clients (lat=%dms)%s\n", il.ip, count, il.lat.Milliseconds(), marker)
+	// Probe WebSockets and keep best
+	activeWebSockets = probeAndSelectBestWS(popIPs, cookie)
 
-		for j := 0; j < count; j++ {
-			name := fmt.Sprintf("%s_%d", il.ip[strings.LastIndex(il.ip, ".")+1:], j+1)
-			c := newHTTPClient(name, il.ip)
-			clients = append(clients, c)
-		}
-		totalClients += count
-	}
-
-	fmt.Printf("\n⏳ Connecting %d clients...\n", totalClients)
-
-	var connWg sync.WaitGroup
-	for _, c := range clients {
-		connWg.Add(1)
-		go func(cl *httpClient) {
-			defer connWg.Done()
-			if cl.connect() == nil {
-				cl.warmup()
-			}
-		}(c)
-	}
-	connWg.Wait()
-
-	ready := 0
-	for _, c := range clients {
-		if c.ready.Load() {
-			ready++
-		}
-	}
-	fmt.Printf("✅ %d/%d clients ready\n", ready, len(clients))
-
-	// Warmup loop
+	// Warmup loop for HTTP clients
 	for i, c := range clients {
 		go func(idx int, cl *httpClient) {
 			time.Sleep(time.Duration(idx*100) * time.Millisecond)
@@ -819,41 +854,19 @@ func main() {
 		}
 	}()
 
-	// Distribute WS across POPs (more on best)
-	fmt.Printf("\n⏳ Starting %d WebSockets...\n", numWebSockets)
+	// Start WebSockets
+	fmt.Printf("\n⏳ Starting %d best WebSockets...\n", len(activeWebSockets))
 
 	var wsWg sync.WaitGroup
-	wsPerIP := make(map[string]int)
-
-	// Allocate WS similar to clients: more on faster IPs
-	wsAlloc := []int{10, 6, 4} // For 3 IPs
-	if len(latencies) > 3 {
-		wsAlloc = make([]int, len(latencies))
-		base := numWebSockets / len(latencies)
-		for i := range wsAlloc {
-			wsAlloc[i] = base
-		}
-		wsAlloc[0] += numWebSockets - base*len(latencies) + 2
-	}
-
-	wsID := 1
-	for i, il := range latencies {
-		count := 4
-		if i < len(wsAlloc) {
-			count = wsAlloc[i]
-		}
-		for j := 0; j < count && wsID <= numWebSockets; j++ {
-			wsWg.Add(1)
-			go runWS(wsID, cookie, il.ip, minCents, &wsWg)
-			wsPerIP[il.ip]++
-			wsID++
-			time.Sleep(50 * time.Millisecond)
-		}
+	for _, wsc := range activeWebSockets {
+		wsWg.Add(1)
+		go runWS(wsc, cookie, minCents, &wsWg)
+		time.Sleep(30 * time.Millisecond)
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d POPs | %d clients | %d WS\n", len(popIPs), len(clients), numWebSockets)
-	fmt.Println("  More resources on faster POPs!")
+	fmt.Printf("  %d POPs | %d best HTTP | %d best WS\n", len(popIPs), len(clients), len(activeWebSockets))
+	fmt.Println("  Only fastest workers selected!")
 	fmt.Println("════════════════════════════════════════════\n")
 
 	wsWg.Wait()
