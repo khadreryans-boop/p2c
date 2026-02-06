@@ -30,7 +30,6 @@ const (
 
 const numWebSockets = 20
 const parallelTakes = 5
-const clientsPerIP = 5
 
 var (
 	pauseTaking atomic.Bool
@@ -43,17 +42,6 @@ var (
 	cookie    string
 	popIPs    []string
 )
-
-// Track IP performance
-type ipStats struct {
-	ip       string
-	minRtt   atomic.Uint64
-	avgRtt   atomic.Uint64
-	requests atomic.Uint64
-}
-
-var ipStatsMap = make(map[string]*ipStats)
-var ipStatsMu sync.RWMutex
 
 // ============ HTTP Client Pool ============
 
@@ -170,52 +158,7 @@ func (c *httpClient) warmup() (time.Duration, error) {
 
 	c.lastUsed = time.Now()
 	c.lastRtt.Store(uint64(dur.Milliseconds()))
-
-	// Update IP stats
-	updateIPStats(c.ip, uint64(dur.Milliseconds()))
-
 	return dur, nil
-}
-
-func updateIPStats(ip string, rttMs uint64) {
-	ipStatsMu.Lock()
-	defer ipStatsMu.Unlock()
-
-	stats, ok := ipStatsMap[ip]
-	if !ok {
-		stats = &ipStats{ip: ip}
-		stats.minRtt.Store(999999)
-		ipStatsMap[ip] = stats
-	}
-
-	// Update min
-	for {
-		old := stats.minRtt.Load()
-		if rttMs >= old || stats.minRtt.CompareAndSwap(old, rttMs) {
-			break
-		}
-	}
-
-	// Update avg (EWMA)
-	reqs := stats.requests.Add(1)
-	oldAvg := stats.avgRtt.Load()
-	if reqs == 1 {
-		stats.avgRtt.Store(rttMs)
-	} else {
-		newAvg := (oldAvg*7 + rttMs*3) / 10
-		stats.avgRtt.Store(newAvg)
-	}
-}
-
-func getIPScore(ip string) uint64 {
-	ipStatsMu.RLock()
-	defer ipStatsMu.RUnlock()
-
-	stats, ok := ipStatsMap[ip]
-	if !ok {
-		return 999999
-	}
-	return stats.minRtt.Load()
 }
 
 func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
@@ -281,8 +224,6 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	c.totalRequests.Add(1)
 	c.totalLatency.Add(rttMs)
 
-	updateIPStats(c.ip, rttMs)
-
 	for {
 		old := c.minLatency.Load()
 		if rttMs >= old || c.minLatency.CompareAndSwap(old, rttMs) {
@@ -299,38 +240,26 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	return code, dur, nil
 }
 
-// Get best clients - prioritize by IP score, then by client RTT
 func getBestClients(count int) []*httpClient {
-	type clientScore struct {
-		c         *httpClient
-		ipScore   uint64
-		clientRtt uint64
+	type cs struct {
+		c   *httpClient
+		rtt uint64
 	}
 
-	var avail []clientScore
+	var avail []cs
 	for _, c := range clients {
 		if c.ready.Load() && !c.inUse.Load() {
-			avail = append(avail, clientScore{
-				c:         c,
-				ipScore:   getIPScore(c.ip),
-				clientRtt: c.lastRtt.Load(),
-			})
+			avail = append(avail, cs{c, c.lastRtt.Load()})
 		}
 	}
 
-	// Sort by IP score first, then by client RTT
 	sort.Slice(avail, func(i, j int) bool {
-		if avail[i].ipScore != avail[j].ipScore {
-			return avail[i].ipScore < avail[j].ipScore
-		}
-		return avail[i].clientRtt < avail[j].clientRtt
+		return avail[i].rtt < avail[j].rtt
 	})
 
-	// Select up to `count` clients, preferring different IPs
 	usedIPs := make(map[string]int)
 	var result []*httpClient
 
-	// First pass: 2 clients max per IP
 	for _, a := range avail {
 		if len(result) >= count {
 			break
@@ -341,7 +270,6 @@ func getBestClients(count int) []*httpClient {
 		}
 	}
 
-	// Second pass: fill remaining from best available
 	for _, a := range avail {
 		if len(result) >= count {
 			break
@@ -671,34 +599,43 @@ func parseCloseReason(p []byte) (uint16, string) {
 }
 
 func printStats() {
-	fmt.Println("\n📊 STATS by IP (sorted by min RTT):")
+	fmt.Println("\n📊 STATS by IP:")
 
-	ipStatsMu.RLock()
+	ipData := make(map[string]struct {
+		reqs, wins       uint64
+		totalLat, minLat uint64
+		clients          int
+	})
+
+	for _, c := range clients {
+		d := ipData[c.ip]
+		d.reqs += c.totalRequests.Load()
+		d.wins += c.wins.Load()
+		d.totalLat += c.totalLatency.Load()
+		min := c.minLatency.Load()
+		if min != 999999999 && (d.minLat == 0 || min < d.minLat) {
+			d.minLat = min
+		}
+		d.clients++
+		ipData[c.ip] = d
+	}
+
 	type ipStat struct {
-		ip   string
-		min  uint64
-		avg  uint64
-		reqs uint64
-		wins uint64
+		ip      string
+		clients int
+		min     uint64
+		avg     uint64
+		reqs    uint64
+		wins    uint64
 	}
 	var stats []ipStat
-	for ip, s := range ipStatsMap {
-		var wins uint64
-		for _, c := range clients {
-			if c.ip == ip {
-				wins += c.wins.Load()
-			}
+	for ip, d := range ipData {
+		avg := uint64(0)
+		if d.reqs > 0 {
+			avg = d.totalLat / d.reqs
 		}
-		stats = append(stats, ipStat{
-			ip:   ip,
-			min:  s.minRtt.Load(),
-			avg:  s.avgRtt.Load(),
-			reqs: s.requests.Load(),
-			wins: wins,
-		})
+		stats = append(stats, ipStat{ip, d.clients, d.minLat, avg, d.reqs, d.wins})
 	}
-	ipStatsMu.RUnlock()
-
 	sort.Slice(stats, func(i, j int) bool {
 		return stats[i].min < stats[j].min
 	})
@@ -706,39 +643,38 @@ func printStats() {
 	for i, s := range stats {
 		marker := ""
 		if i == 0 {
-			marker = " ⭐ BEST"
+			marker = " ⭐"
 		}
-		fmt.Printf("  %s: min=%dms avg=%dms reqs=%d wins=%d%s\n",
-			s.ip, s.min, s.avg, s.reqs, s.wins, marker)
+		fmt.Printf("  %s: %d clients | min=%dms avg=%dms | reqs=%d wins=%d%s\n",
+			s.ip, s.clients, s.min, s.avg, s.reqs, s.wins, marker)
 	}
+}
 
-	fmt.Println("\n  Per client (top 10 by wins):")
-	type cstat struct {
-		name string
-		ip   string
-		rtt  uint64
-		wins uint64
+// Measure IP latency
+func measureIP(ip string) time.Duration {
+	c := newHTTPClient("probe", ip)
+	if err := c.connect(); err != nil {
+		return 999 * time.Second
 	}
-	var cstats []cstat
-	for _, c := range clients {
-		cstats = append(cstats, cstat{c.name, c.ip, c.lastRtt.Load(), c.wins.Load()})
-	}
-	sort.Slice(cstats, func(i, j int) bool {
-		return cstats[i].wins > cstats[j].wins
-	})
-	for i, cs := range cstats {
-		if i >= 10 {
-			break
+	defer c.conn.Close()
+
+	var total time.Duration
+	for i := 0; i < 3; i++ {
+		dur, err := c.warmup()
+		if err != nil {
+			return 999 * time.Second
 		}
-		fmt.Printf("    %s@%s: rtt=%d wins=%d\n", cs.name, cs.ip[strings.LastIndex(cs.ip, ".")+1:], cs.rtt, cs.wins)
+		total += dur
+		time.Sleep(50 * time.Millisecond)
 	}
+	return total / 3
 }
 
 func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - Smart IP Priority           ║")
+	fmt.Println("║  P2C SNIPER - Smart IP Allocation         ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -766,13 +702,43 @@ func main() {
 	}
 
 	popIPs = ips
-	fmt.Printf("✅ Found %d POP IPs:\n", len(popIPs))
+	fmt.Printf("✅ Found %d POP IPs\n", len(popIPs))
+
+	// Measure latency to each IP
+	fmt.Println("\n⏳ Measuring latency to each POP...")
+	type ipLatency struct {
+		ip  string
+		lat time.Duration
+	}
+	var latencies []ipLatency
+
 	for _, ip := range popIPs {
-		fmt.Printf("   • %s\n", ip)
-		ipStatsMap[ip] = &ipStats{ip: ip}
-		ipStatsMap[ip].minRtt.Store(999999)
+		lat := measureIP(ip)
+		latencies = append(latencies, ipLatency{ip, lat})
+		fmt.Printf("   %s: %dms\n", ip, lat.Milliseconds())
 	}
 
+	// Sort by latency (best first)
+	sort.Slice(latencies, func(i, j int) bool {
+		return latencies[i].lat < latencies[j].lat
+	})
+
+	// Allocate clients: more on faster IPs
+	// Best: 7 clients, Middle: 5 clients, Worst: 3 clients
+	clientCounts := []int{7, 5, 3}
+	if len(latencies) > 3 {
+		// If more than 3 IPs, distribute evenly with bonus to best
+		clientCounts = make([]int, len(latencies))
+		for i := range clientCounts {
+			clientCounts[i] = 3
+		}
+		clientCounts[0] = 6
+		if len(clientCounts) > 1 {
+			clientCounts[1] = 5
+		}
+	}
+
+	fmt.Println("\n📊 Client allocation (sorted by latency):")
 	reqPrefix = []byte("POST " + takePathPrefix)
 	reqSuffix = []byte(" HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -781,15 +747,28 @@ func main() {
 		"Content-Length: 2\r\n" +
 		"\r\n{}")
 
-	fmt.Printf("\n⏳ Creating %d clients per IP...\n", clientsPerIP)
+	totalClients := 0
+	for i, il := range latencies {
+		count := 3
+		if i < len(clientCounts) {
+			count = clientCounts[i]
+		}
 
-	for _, ip := range popIPs {
-		for i := 0; i < clientsPerIP; i++ {
-			name := fmt.Sprintf("%s_%d", ip[strings.LastIndex(ip, ".")+1:], i+1)
-			c := newHTTPClient(name, ip)
+		marker := ""
+		if i == 0 {
+			marker = " ⭐ BEST"
+		}
+		fmt.Printf("   %s: %d clients (lat=%dms)%s\n", il.ip, count, il.lat.Milliseconds(), marker)
+
+		for j := 0; j < count; j++ {
+			name := fmt.Sprintf("%s_%d", il.ip[strings.LastIndex(il.ip, ".")+1:], j+1)
+			c := newHTTPClient(name, il.ip)
 			clients = append(clients, c)
 		}
+		totalClients += count
 	}
+
+	fmt.Printf("\n⏳ Connecting %d clients...\n", totalClients)
 
 	var connWg sync.WaitGroup
 	for _, c := range clients {
@@ -811,6 +790,7 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d clients ready\n", ready, len(clients))
 
+	// Warmup loop
 	for i, c := range clients {
 		go func(idx int, cl *httpClient) {
 			time.Sleep(time.Duration(idx*100) * time.Millisecond)
@@ -839,19 +819,41 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("\n⏳ Starting %d WebSockets across %d POPs...\n", numWebSockets, len(popIPs))
+	// Distribute WS across POPs (more on best)
+	fmt.Printf("\n⏳ Starting %d WebSockets...\n", numWebSockets)
 
 	var wsWg sync.WaitGroup
-	for i := 1; i <= numWebSockets; i++ {
-		ip := popIPs[(i-1)%len(popIPs)]
-		wsWg.Add(1)
-		go runWS(i, cookie, ip, minCents, &wsWg)
-		time.Sleep(50 * time.Millisecond)
+	wsPerIP := make(map[string]int)
+
+	// Allocate WS similar to clients: more on faster IPs
+	wsAlloc := []int{10, 6, 4} // For 3 IPs
+	if len(latencies) > 3 {
+		wsAlloc = make([]int, len(latencies))
+		base := numWebSockets / len(latencies)
+		for i := range wsAlloc {
+			wsAlloc[i] = base
+		}
+		wsAlloc[0] += numWebSockets - base*len(latencies) + 2
+	}
+
+	wsID := 1
+	for i, il := range latencies {
+		count := 4
+		if i < len(wsAlloc) {
+			count = wsAlloc[i]
+		}
+		for j := 0; j < count && wsID <= numWebSockets; j++ {
+			wsWg.Add(1)
+			go runWS(wsID, cookie, il.ip, minCents, &wsWg)
+			wsPerIP[il.ip]++
+			wsID++
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d POPs | %d clients | %d WS | 5 takes\n", len(popIPs), len(clients), numWebSockets)
-	fmt.Println("  Clients sorted by IP score, then RTT")
+	fmt.Printf("  %d POPs | %d clients | %d WS\n", len(popIPs), len(clients), numWebSockets)
+	fmt.Println("  More resources on faster POPs!")
 	fmt.Println("════════════════════════════════════════════\n")
 
 	wsWg.Wait()
