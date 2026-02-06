@@ -29,7 +29,7 @@ const (
 )
 
 const numClients = 15
-const numWebSockets = 5
+const numWebSockets = 20
 const parallelTakes = 5
 
 var (
@@ -37,12 +37,10 @@ var (
 	seenOrders  sync.Map
 )
 
-// Pre-built request parts (no allocation during take)
 var (
-	reqPrefix  []byte
-	reqMiddle  []byte
-	reqSuffix  []byte
-	cookieData []byte
+	reqPrefix []byte
+	reqSuffix []byte
+	cookie    string
 )
 
 // ============ HTTP Client Pool ============
@@ -85,15 +83,13 @@ func (c *httpClient) connect() error {
 	}
 
 	dialer := &net.Dialer{
-		Timeout:   2 * time.Second,
-		KeepAlive: 5 * time.Second,
+		Timeout:   3 * time.Second,
+		KeepAlive: 10 * time.Second,
 	}
 
 	tlsConfig := &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: false,
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS12, // TLS 1.2 faster handshake than 1.3
+		ServerName: host,
+		MinVersion: tls.VersionTLS12,
 	}
 
 	conn, err := tls.DialWithDialer(dialer, "tcp", host+":443", tlsConfig)
@@ -104,19 +100,18 @@ func (c *httpClient) connect() error {
 	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
 		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(5 * time.Second)
-		tcpConn.SetWriteBuffer(4096)
-		tcpConn.SetReadBuffer(4096)
+		tcpConn.SetKeepAlivePeriod(10 * time.Second)
 	}
 
 	c.conn = conn
-	c.br = bufio.NewReaderSize(conn, 2048)
-	c.bw = bufio.NewWriterSize(conn, 1024)
+	c.br = bufio.NewReaderSize(conn, 4096)
+	c.bw = bufio.NewWriterSize(conn, 2048)
 	c.lastUsed = time.Now()
 	c.ready.Store(true)
 	return nil
 }
 
+// HEAD warmup
 func (c *httpClient) warmup() (time.Duration, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -125,14 +120,19 @@ func (c *httpClient) warmup() (time.Duration, error) {
 		return 0, fmt.Errorf("no conn")
 	}
 
-	c.conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	c.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	// Minimal warmup request
-	c.bw.Write(reqPrefix)
-	c.bw.WriteString("000000000000000000000000") // fake ID
-	c.bw.Write(reqSuffix)
+	req := "HEAD /p2c/orders HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Cookie: " + cookie + "\r\n" +
+		"Connection: keep-alive\r\n" +
+		"\r\n"
 
 	start := time.Now()
+	_, err := c.bw.WriteString(req)
+	if err != nil {
+		return 0, err
+	}
 	if err := c.bw.Flush(); err != nil {
 		return 0, err
 	}
@@ -144,16 +144,12 @@ func (c *httpClient) warmup() (time.Duration, error) {
 	}
 	_ = line
 
-	// Drain response
 	for {
 		line, err = c.br.ReadString('\n')
 		if err != nil || line == "\r\n" {
 			break
 		}
 	}
-	// Read small body (error response)
-	tmp := make([]byte, 256)
-	c.br.Read(tmp)
 
 	c.lastUsed = time.Now()
 	c.lastRtt.Store(uint64(dur.Milliseconds()))
@@ -168,9 +164,8 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 		return 0, 0, fmt.Errorf("no conn")
 	}
 
-	c.conn.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	c.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	// Write request with pre-built parts
 	c.bw.Write(reqPrefix)
 	c.bw.WriteString(orderID)
 	c.bw.Write(reqSuffix)
@@ -201,19 +196,17 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	}
 	code, _ := strconv.Atoi(line[9:12])
 
-	// Drain headers
 	contentLen := 0
 	for {
 		line, err := c.br.ReadString('\n')
 		if err != nil || line == "\r\n" {
 			break
 		}
-		if len(line) > 16 && (line[0] == 'C' || line[0] == 'c') {
+		if len(line) > 15 && (line[0] == 'C' || line[0] == 'c') {
 			fmt.Sscanf(line, "Content-Length: %d", &contentLen)
 		}
 	}
 
-	// Drain body
 	if contentLen > 0 && contentLen < 4096 {
 		tmp := make([]byte, contentLen)
 		io.ReadFull(c.br, tmp)
@@ -291,7 +284,7 @@ func instantTake(id, amt string, wsID int, wsTime time.Time) {
 		return
 	}
 
-	fmt.Printf("📥 [WS%d] %s amt=%s (%d clients)\n", wsID, id, amt, len(best))
+	fmt.Printf("📥 [WS%02d] %s amt=%s (%d clients)\n", wsID, id, amt, len(best))
 
 	results := make(chan takeResult, len(best))
 	var wg sync.WaitGroup
@@ -497,13 +490,13 @@ func runWS(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 	for {
 		conn, err := connectWS(cookie)
 		if err != nil {
-			fmt.Printf("[WS%d] err: %v\n", wsID, err)
+			fmt.Printf("[WS%02d] err: %v\n", wsID, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
 		wsc := &wsConn{conn: conn}
-		fmt.Printf("[WS%d] 🔌\n", wsID)
+		fmt.Printf("[WS%02d] 🔌\n", wsID)
 
 		p, op, err := readFrame(conn)
 		if err != nil || op == ws.OpClose {
@@ -524,7 +517,7 @@ func runWS(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 		time.Sleep(30 * time.Millisecond)
 		wsc.write([]byte(`42["list:snapshot",[]]`))
 
-		fmt.Printf("[WS%d] 🚀\n", wsID)
+		fmt.Printf("[WS%02d] 🚀\n", wsID)
 
 		for {
 			p, op, err := readFrame(conn)
@@ -559,7 +552,7 @@ func runWS(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 
 	reconn:
 		conn.Close()
-		fmt.Printf("[WS%d] 🔄\n", wsID)
+		fmt.Printf("[WS%02d] 🔄\n", wsID)
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -611,11 +604,11 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - Ultra Optimized             ║")
+	fmt.Println("║  P2C SNIPER - 20 WS + HEAD warmup         ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
-	cookie, _ := in.ReadString('\n')
+	cookie, _ = in.ReadString('\n')
 	cookie = strings.TrimSpace(cookie)
 	if !strings.HasPrefix(cookie, "access_token=") {
 		fmt.Println("Invalid")
@@ -631,14 +624,7 @@ func main() {
 		minCents = int64(f * 100)
 	}
 
-	// Build minimal request template
-	// POST /internal/v1/p2c/payments/take/ORDER_ID HTTP/1.1\r\n
-	// Host: app.send.tg\r\n
-	// Content-Type: application/json\r\n
-	// Cookie: access_token=...\r\n
-	// Content-Length: 2\r\n
-	// \r\n
-	// {}
+	// Build request template
 	reqPrefix = []byte("POST " + takePathPrefix)
 	reqSuffix = []byte(" HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -647,7 +633,7 @@ func main() {
 		"Content-Length: 2\r\n" +
 		"\r\n{}")
 
-	fmt.Printf("\n⏳ Connecting %d clients...\n", numClients)
+	fmt.Printf("\n⏳ Connecting %d HTTP clients...\n", numClients)
 
 	var connWg sync.WaitGroup
 	for i := 0; i < numClients; i++ {
@@ -670,13 +656,13 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d ready\n", ready, numClients)
 
-	// Warmup every 500ms per client (staggered)
+	// Warmup every 2 seconds (staggered)
 	for i := 0; i < numClients; i++ {
 		go func(idx int) {
 			c := clients[idx]
-			time.Sleep(time.Duration(idx*33) * time.Millisecond)
+			time.Sleep(time.Duration(idx*133) * time.Millisecond)
 			for {
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(2 * time.Second)
 				if c.inUse.Load() {
 					continue
 				}
@@ -684,8 +670,8 @@ func main() {
 					c.connect()
 					continue
 				}
-				dur, err := c.warmup()
-				if err != nil || dur > 400*time.Millisecond {
+				_, err := c.warmup()
+				if err != nil {
 					c.ready.Store(false)
 					c.connect()
 				}
@@ -706,11 +692,11 @@ func main() {
 	for i := 1; i <= numWebSockets; i++ {
 		wsWg.Add(1)
 		go runWS(i, cookie, minCents, &wsWg)
-		time.Sleep(80 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  Warmup: 500ms | Timeout: 1.5s | Min headers")
+	fmt.Println("  20 WebSockets | HEAD warmup every 2s")
 	fmt.Println("════════════════════════════════════════════\n")
 
 	wsWg.Wait()
