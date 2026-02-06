@@ -29,8 +29,8 @@ const (
 
 const (
 	numWebSockets = 20
-	numTakers     = 2 // Только 2 лучших
-	parallelTakes = 2 // Оба делают take
+	numTakers     = 4 // 4 takers
+	parallelTakes = 4 // Все делают take
 )
 
 var (
@@ -533,9 +533,9 @@ func main() {
 	for i, t := range takers {
 		go func(idx int, tk *taker) {
 			// Stagger
-			time.Sleep(time.Duration(idx*250) * time.Millisecond)
+			time.Sleep(time.Duration(idx*50) * time.Millisecond)
 			for {
-				time.Sleep(500 * time.Millisecond) // Часто - HEAD не считается
+				time.Sleep(200 * time.Millisecond) // Агрессивнее - 200ms
 				if !tk.inUse.Load() && tk.ready.Load() {
 					tk.warmup()
 				} else if !tk.ready.Load() {
@@ -553,7 +553,7 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | warmup via POST /accounts (500ms)\n", numWebSockets, numTakers)
+	fmt.Printf("  %d WS | %d takers | warmup via POST /accounts (200ms)\n", numWebSockets, numTakers)
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
