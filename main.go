@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"os"
 	"strings"
 	"sync"
@@ -26,7 +25,6 @@ const (
 
 var cookie string
 
-// Track who sees first
 var (
 	ordersMu    sync.Mutex
 	ordersFirst = make(map[string]string)
@@ -48,7 +46,7 @@ func recordOrder(id, source string) {
 	ordersFirst[id] = source
 	ordersTimes[id] = time.Now()
 
-	if strings.HasPrefix(source, "WS") {
+	if source == "WS" {
 		wsWins++
 	} else {
 		pollWins++
@@ -59,14 +57,11 @@ func recordOrder(id, source string) {
 
 // ============ WebSocket ============
 
-func runWS(id int, ip string) {
-	source := fmt.Sprintf("WS%d", id)
-	ipShort := ip[strings.LastIndex(ip, ".")+1:]
-
+func runWS(ip string) {
 	for {
 		conn, err := connectWS(ip)
 		if err != nil {
-			fmt.Printf("[%s] connect err: %v\n", source, err)
+			fmt.Printf("[WS] connect err: %v\n", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -80,11 +75,12 @@ func runWS(id int, ip string) {
 		time.Sleep(30 * time.Millisecond)
 		writeFrame(conn, []byte(`42["list:snapshot",[]]`))
 
-		fmt.Printf("[%s@%s] 🚀 connected\n", source, ipShort)
+		fmt.Printf("[WS] 🚀 connected\n")
 
 		for {
 			data, op, err := readFrame(conn)
 			if err != nil {
+				fmt.Printf("[WS] read err: %v\n", err)
 				break
 			}
 
@@ -94,7 +90,7 @@ func runWS(id int, ip string) {
 					continue
 				}
 				if len(data) > 2 && data[0] == '4' && data[1] == '2' {
-					parseOrder(data[2:], source)
+					parseOrder(data[2:], "WS")
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -154,55 +150,9 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
-// ============ HTTP Polling with http.Client ============
+// ============ HTTP Polling ============
 
-func runPoll(id int, ip string) {
-	source := fmt.Sprintf("POLL%d", id)
-	ipShort := ip[strings.LastIndex(ip, ".")+1:]
-
-	for {
-		sid, client, err := pollConnect(ip)
-		if err != nil {
-			fmt.Printf("[%s] connect err: %v\n", source, err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		fmt.Printf("[%s@%s] 🚀 connected (sid=%s...)\n", source, ipShort, sid[:12])
-
-		errCount := 0
-		for {
-			data, err := pollGet(client, sid)
-			if err != nil {
-				errCount++
-				fmt.Printf("[%s] poll err #%d: %v\n", source, errCount, err)
-				if errCount >= 3 {
-					break
-				}
-				time.Sleep(200 * time.Millisecond)
-				continue
-			}
-			errCount = 0
-
-			if len(data) == 1 && data[0] == '2' {
-				if err := pollPost(client, sid, "3"); err != nil {
-					fmt.Printf("[%s] pong err: %v\n", source, err)
-					break
-				}
-				continue
-			}
-
-			if len(data) > 5 {
-				parseOrder(data, source)
-			}
-		}
-
-		time.Sleep(1 * time.Second)
-	}
-}
-
-func pollConnect(ip string) (string, *http.Client, error) {
-	// Create transport that forces specific IP
+func runPoll(ip string) {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := net.DialTimeout("tcp", ip+":443", 5*time.Second)
@@ -212,110 +162,188 @@ func pollConnect(ip string) (string, *http.Client, error) {
 			if tc, ok := conn.(*net.TCPConn); ok {
 				tc.SetNoDelay(true)
 				tc.SetKeepAlive(true)
-				tc.SetKeepAlivePeriod(10 * time.Second)
 			}
 			return conn, nil
 		},
-		TLSClientConfig: &tls.Config{
-			ServerName: host,
-		},
-		MaxIdleConns:        1,
-		MaxIdleConnsPerHost: 1,
-		IdleConnTimeout:     60 * time.Second,
-		DisableKeepAlives:   false,
-		ForceAttemptHTTP2:   false, // Disable HTTP/2!
+		TLSClientConfig:   &tls.Config{ServerName: host},
+		DisableKeepAlives: false,
+		ForceAttemptHTTP2: false,
 	}
 
-	jar, _ := cookiejar.New(nil)
 	client := &http.Client{
 		Transport: transport,
-		Jar:       jar,
 		Timeout:   30 * time.Second,
 	}
 
-	// Handshake
-	req, _ := http.NewRequest("GET", pollURL, nil)
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("Origin", "https://app.send.tg")
+	for {
+		// Handshake
+		req, _ := http.NewRequest("GET", pollURL, nil)
+		req.Header.Set("Cookie", cookie)
+		req.Header.Set("Origin", "https://app.send.tg")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", nil, fmt.Errorf("handshake: %v", err)
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("[POLL] handshake err: %v\n", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			fmt.Printf("[POLL] handshake code: %d\n", resp.StatusCode)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Parse sid
+		sidIdx := bytes.Index(body, []byte(`"sid":"`))
+		if sidIdx == -1 {
+			fmt.Printf("[POLL] no sid\n")
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		sid := string(body[sidIdx+7 : sidIdx+7+bytes.IndexByte(body[sidIdx+7:], '"')])
+
+		// Send 40
+		url := pollURL + "&sid=" + sid
+		req, _ = http.NewRequest("POST", url, strings.NewReader("40"))
+		req.Header.Set("Cookie", cookie)
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		req.Header.Set("Origin", "https://app.send.tg")
+
+		resp, err = client.Do(req)
+		if err != nil {
+			fmt.Printf("[POLL] send 40 err: %v\n", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			fmt.Printf("[POLL] send 40 code: %d\n", resp.StatusCode)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Poll for ACK
+		req, _ = http.NewRequest("GET", url, nil)
+		req.Header.Set("Cookie", cookie)
+		req.Header.Set("Origin", "https://app.send.tg")
+
+		resp, err = client.Do(req)
+		if err != nil {
+			fmt.Printf("[POLL] ack err: %v\n", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			fmt.Printf("[POLL] ack code: %d\n", resp.StatusCode)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Initialize
+		time.Sleep(30 * time.Millisecond)
+		req, _ = http.NewRequest("POST", url, strings.NewReader(`42["list:initialize"]`))
+		req.Header.Set("Cookie", cookie)
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		req.Header.Set("Origin", "https://app.send.tg")
+		resp, _ = client.Do(req)
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		time.Sleep(30 * time.Millisecond)
+		req, _ = http.NewRequest("POST", url, strings.NewReader(`42["list:snapshot",[]]`))
+		req.Header.Set("Cookie", cookie)
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+		req.Header.Set("Origin", "https://app.send.tg")
+		resp, _ = client.Do(req)
+		if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+
+		fmt.Printf("[POLL] 🚀 connected (sid=%s...)\n", sid[:12])
+
+		// Poll loop
+		for {
+			req, _ = http.NewRequest("GET", url, nil)
+			req.Header.Set("Cookie", cookie)
+			req.Header.Set("Origin", "https://app.send.tg")
+
+			resp, err = client.Do(req)
+			if err != nil {
+				fmt.Printf("[POLL] poll err: %v\n", err)
+				break
+			}
+
+			if resp.StatusCode != 200 {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				fmt.Printf("[POLL] poll code: %d\n", resp.StatusCode)
+				break
+			}
+
+			body, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			// Ping
+			if len(body) == 1 && body[0] == '2' {
+				req, _ = http.NewRequest("POST", url, strings.NewReader("3"))
+				req.Header.Set("Cookie", cookie)
+				req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+				req.Header.Set("Origin", "https://app.send.tg")
+				resp, err = client.Do(req)
+				if err != nil || resp.StatusCode != 200 {
+					if resp != nil {
+						io.Copy(io.Discard, resp.Body)
+						resp.Body.Close()
+					}
+					fmt.Printf("[POLL] pong err\n")
+					break
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				continue
+			}
+
+			// Parse orders
+			if len(body) > 5 {
+				parseOrder(body, "POLL")
+			}
+		}
+
+		// Create new client for fresh connection
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := net.DialTimeout("tcp", ip+":443", 5*time.Second)
+				if err != nil {
+					return nil, err
+				}
+				if tc, ok := conn.(*net.TCPConn); ok {
+					tc.SetNoDelay(true)
+					tc.SetKeepAlive(true)
+				}
+				return conn, nil
+			},
+			TLSClientConfig:   &tls.Config{ServerName: host},
+			DisableKeepAlives: false,
+			ForceAttemptHTTP2: false,
+		}
+		client = &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+		}
+
+		time.Sleep(1 * time.Second)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return "", nil, fmt.Errorf("handshake code: %d", resp.StatusCode)
-	}
-
-	// Parse sid
-	sidIdx := bytes.Index(body, []byte(`"sid":"`))
-	if sidIdx == -1 {
-		return "", nil, fmt.Errorf("no sid")
-	}
-	sidStart := sidIdx + 7
-	sidEnd := bytes.IndexByte(body[sidStart:], '"')
-	if sidEnd == -1 {
-		return "", nil, fmt.Errorf("invalid sid")
-	}
-	sid := string(body[sidStart : sidStart+sidEnd])
-
-	// Send 40
-	if err := pollPost(client, sid, "40"); err != nil {
-		return "", nil, fmt.Errorf("send 40: %v", err)
-	}
-
-	// Poll for ACK
-	if _, err := pollGet(client, sid); err != nil {
-		return "", nil, fmt.Errorf("poll ack: %v", err)
-	}
-
-	time.Sleep(30 * time.Millisecond)
-	pollPost(client, sid, `42["list:initialize"]`)
-	time.Sleep(30 * time.Millisecond)
-	pollPost(client, sid, `42["list:snapshot",[]]`)
-
-	return sid, client, nil
-}
-
-func pollPost(client *http.Client, sid, msg string) error {
-	url := pollURL + "&sid=" + sid
-	req, _ := http.NewRequest("POST", url, strings.NewReader(msg))
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-	req.Header.Set("Origin", "https://app.send.tg")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func pollGet(client *http.Client, sid string) ([]byte, error) {
-	url := pollURL + "&sid=" + sid
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("Origin", "https://app.send.tg")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return body, nil
 }
 
 // ============ Parser ============
@@ -345,7 +373,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: 2 WS vs 2 POLL (http.Client)       ║")
+	fmt.Println("║  RACE: 1 WS vs 1 POLL                     ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -362,24 +390,19 @@ func main() {
 		fmt.Printf("DNS error: %v\n", err)
 		return
 	}
-	fmt.Printf("✅ Found %d POPs: %v\n", len(ips), ips)
+	ip := ips[0]
+	fmt.Printf("✅ Using IP: %s\n", ip)
 
-	// Start 2 WebSockets
-	fmt.Println("\n⏳ Starting 2 WebSockets...")
-	go runWS(1, ips[0])
-	time.Sleep(100 * time.Millisecond)
-	go runWS(2, ips[1%len(ips)])
+	fmt.Println("\n⏳ Starting WebSocket...")
+	go runWS(ip)
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
-	// Start 2 Pollers
-	fmt.Println("⏳ Starting 2 Pollers...")
-	go runPoll(1, ips[0])
-	time.Sleep(100 * time.Millisecond)
-	go runPoll(2, ips[1%len(ips)])
+	fmt.Println("⏳ Starting Polling...")
+	go runPoll(ip)
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  2 WS vs 2 POLL - watching for orders...")
+	fmt.Println("  1 WS vs 1 POLL on same IP")
 	fmt.Println("  🥇 = first to see order")
 	fmt.Println("════════════════════════════════════════════\n")
 
