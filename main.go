@@ -313,6 +313,9 @@ func pollConnect() (net.Conn, *bufio.Reader, *bufio.Writer, string, time.Duratio
 			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			body, code := readHTTPResponse(br)
 			if code != 200 {
+				fmt.Printf("[POLL] handshake raw body: %q\n", safeBody(body))
+				fmt.Printf("[POLL] handshake FULL body: %s\n", string(body))
+
 				_ = conn.Close()
 				return nil, nil, nil, "", 0, fmt.Errorf("ack code: %d body=%q", code, safeBody(body))
 			}
