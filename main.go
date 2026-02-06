@@ -28,7 +28,7 @@ const (
 
 const (
 	numWebSockets = 20
-	numTakers     = 6
+	numTakers     = 5
 )
 
 var (
