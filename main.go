@@ -187,9 +187,10 @@ func runPoll() {
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			fmt.Fprintf(bw, "GET %s&sid=%s&t=%d HTTP/1.1\r\n", pollPath, sid, t)
 			fmt.Fprintf(bw, "Host: %s\r\n", host)
+			writeBrowserHeaders(bw)
 			fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
-			fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
 			fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
+
 			if err := bw.Flush(); err != nil {
 				fmt.Printf("[POLL] flush err: %v\n", err)
 				break
@@ -230,6 +231,17 @@ func runPoll() {
 	}
 }
 
+func writeBrowserHeaders(bw *bufio.Writer) {
+	fmt.Fprintf(bw, "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n")
+	fmt.Fprintf(bw, "Accept: */*\r\n")
+	fmt.Fprintf(bw, "Accept-Language: en-US,en;q=0.9\r\n")
+	fmt.Fprintf(bw, "Referer: https://app.send.tg/\r\n")
+	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
+	fmt.Fprintf(bw, "Sec-Fetch-Site: same-origin\r\n")
+	fmt.Fprintf(bw, "Sec-Fetch-Mode: cors\r\n")
+	fmt.Fprintf(bw, "Sec-Fetch-Dest: empty\r\n")
+}
+
 func pollConnect() (net.Conn, *bufio.Reader, *bufio.Writer, string, time.Duration, error) {
 	// ВАЖНО: не фиксируем IP. Иначе SID может “умереть” на другом инстансе.
 	conn, err := tls.DialWithDialer(
@@ -251,9 +263,10 @@ func pollConnect() (net.Conn, *bufio.Reader, *bufio.Writer, string, time.Duratio
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		fmt.Fprintf(bw, "GET %s&t=%d HTTP/1.1\r\n", pollPath, t)
 		fmt.Fprintf(bw, "Host: %s\r\n", host)
+		writeBrowserHeaders(bw)
 		fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
-		fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
 		fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
+
 		if err := bw.Flush(); err != nil {
 			_ = conn.Close()
 			return nil, nil, nil, "", 0, err
@@ -355,11 +368,12 @@ func pollPostPackets(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, sid stri
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	fmt.Fprintf(bw, "POST %s&sid=%s&t=%d HTTP/1.1\r\n", pollPath, sid, t)
 	fmt.Fprintf(bw, "Host: %s\r\n", host)
+	writeBrowserHeaders(bw)
 	fmt.Fprintf(bw, "Cookie: %s\r\n", cookie)
-	fmt.Fprintf(bw, "Origin: https://app.send.tg\r\n")
 	fmt.Fprintf(bw, "Content-Type: text/plain;charset=UTF-8\r\n")
 	fmt.Fprintf(bw, "Content-Length: %d\r\n", len(payload))
 	fmt.Fprintf(bw, "Connection: keep-alive\r\n\r\n")
+
 	fmt.Fprintf(bw, "%s", payload)
 
 	if err := bw.Flush(); err != nil {
