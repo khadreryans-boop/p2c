@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,38 +28,58 @@ const (
 
 const (
 	numWebSockets = 20
-	numTakers     = 4 // 4 takers
-	parallelTakes = 4 // Все делают take
+	numTakers     = 6
 )
 
 var (
 	pauseTaking atomic.Bool
-	seenOrders  sync.Map
 	cookie      string
-	reqPrefix   []byte
-	reqSuffix   []byte
 	serverIP    string
 )
 
-// Stats
+// Pre-built request parts (zero alloc on hot path)
+var reqPrefix []byte
+var reqSuffix []byte
+
+// Dedupe with minimal locking
 var (
-	statsMu   sync.Mutex
-	totalSeen int
-	totalWon  int
-	totalLate int
+	seenMu sync.Mutex
+	seen   = make(map[string]struct{})
 )
 
-// ============ Taker ============
+func markSeen(id string) bool {
+	seenMu.Lock()
+	if _, ok := seen[id]; ok {
+		seenMu.Unlock()
+		return false
+	}
+	seen[id] = struct{}{}
+	seenMu.Unlock()
+	go func() {
+		time.Sleep(5 * time.Second)
+		seenMu.Lock()
+		delete(seen, id)
+		seenMu.Unlock()
+	}()
+	return true
+}
+
+// Stats
+var (
+	totalSeen atomic.Int64
+	totalWon  atomic.Int64
+	totalLate atomic.Int64
+)
+
+// ============ Taker (Fire-and-Forget) ============
 
 type taker struct {
-	conn    net.Conn
-	br      *bufio.Reader
-	bw      *bufio.Writer
-	mu      sync.Mutex
-	ready   atomic.Bool
-	inUse   atomic.Bool
-	lastRtt atomic.Uint64
-	id      int
+	conn  net.Conn
+	br    *bufio.Reader
+	bw    *bufio.Writer
+	mu    sync.Mutex
+	ready atomic.Bool
+	id    int
 }
 
 var takers []*taker
@@ -99,41 +118,55 @@ func (t *taker) connect() error {
 	return nil
 }
 
-func (t *taker) take(orderID string) (int, time.Duration, error) {
+// Fire-and-forget: отправляем и НЕ ЖДЁМ ответа
+func (t *taker) fireAndForget(orderID []byte) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.conn == nil {
-		return 0, 0, fmt.Errorf("no conn")
+		return false
 	}
 
-	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
+	t.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 
+	// Пишем запрос напрямую без аллокаций
 	t.bw.Write(reqPrefix)
-	t.bw.WriteString(orderID)
+	t.bw.Write(orderID)
 	t.bw.Write(reqSuffix)
 
-	start := time.Now()
 	if err := t.bw.Flush(); err != nil {
 		t.conn.Close()
 		t.conn = nil
 		t.ready.Store(false)
-		return 0, 0, err
+		return false
 	}
 
-	line, err := t.br.ReadString('\n')
-	dur := time.Since(start)
+	return true
+}
 
+// Читаем ответ отдельно (в фоне)
+func (t *taker) readResponse() (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.conn == nil {
+		return 0, fmt.Errorf("no conn")
+	}
+
+	t.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	line, err := t.br.ReadString('\n')
 	if err != nil {
 		t.conn.Close()
 		t.conn = nil
 		t.ready.Store(false)
-		return 0, dur, err
+		return 0, err
 	}
 
 	if len(line) < 12 {
-		return 0, dur, fmt.Errorf("short")
+		return 0, fmt.Errorf("short")
 	}
+
 	code, _ := strconv.Atoi(line[9:12])
 
 	// Drain
@@ -144,11 +177,10 @@ func (t *taker) take(orderID string) (int, time.Duration, error) {
 		}
 	}
 
-	t.lastRtt.Store(uint64(dur.Milliseconds()))
-	return code, dur, nil
+	return code, nil
 }
 
-// Warmup через POST /accounts (прогревает бэкенд, не лимитируется)
+// Warmup
 func (t *taker) warmup() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -159,7 +191,6 @@ func (t *taker) warmup() {
 
 	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-	// POST на /accounts - прогревает путь до бэкенда
 	req := "POST /internal/v1/p2c/accounts HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
 		"Cookie: " + cookie + "\r\n" +
@@ -167,13 +198,7 @@ func (t *taker) warmup() {
 		"Content-Length: 2\r\n" +
 		"Connection: keep-alive\r\n\r\n{}"
 
-	start := time.Now()
-	if _, err := t.bw.WriteString(req); err != nil {
-		t.conn.Close()
-		t.conn = nil
-		t.ready.Store(false)
-		return
-	}
+	t.bw.WriteString(req)
 	if err := t.bw.Flush(); err != nil {
 		t.conn.Close()
 		t.conn = nil
@@ -181,9 +206,7 @@ func (t *taker) warmup() {
 		return
 	}
 
-	_, err := t.br.ReadString('\n')
-	dur := time.Since(start)
-
+	line, err := t.br.ReadString('\n')
 	if err != nil {
 		t.conn.Close()
 		t.conn = nil
@@ -191,10 +214,10 @@ func (t *taker) warmup() {
 		return
 	}
 
-	// Drain headers and get content-length
+	// Drain headers
 	contentLen := 0
 	for {
-		line, _ := t.br.ReadString('\n')
+		line, _ = t.br.ReadString('\n')
 		if line == "\r\n" || line == "" {
 			break
 		}
@@ -203,180 +226,155 @@ func (t *taker) warmup() {
 		}
 	}
 
-	// Drain body
 	if contentLen > 0 {
 		body := make([]byte, contentLen)
 		io.ReadFull(t.br, body)
 	}
-
-	t.lastRtt.Store(uint64(dur.Milliseconds()))
 }
 
-func getAvailable() []*taker {
-	var avail []*taker
-	for _, t := range takers {
-		if t.ready.Load() && !t.inUse.Load() {
-			avail = append(avail, t)
-		}
-	}
-	return avail
-}
+// ============ Ultra-fast Take ============
 
-// ============ Take Logic ============
+// Паттерны для поиска (pre-allocated)
+var (
+	patternOpAdd = []byte(`"op":"add"`)
+	patternID    = []byte(`"id":"`)
+	patternAmt   = []byte(`"in_amount":"`)
+)
 
-func doTake(id, amt string, wsID int, detectTime time.Time) {
+func ultraFastTake(data []byte, wsID int, detectTime time.Time, minCents int64) {
 	if pauseTaking.Load() {
 		return
 	}
-	if _, loaded := seenOrders.LoadOrStore(id, struct{}{}); loaded {
+
+	// Быстрая проверка без аллокаций
+	if !bytes.Contains(data, patternOpAdd) {
 		return
 	}
 
-	statsMu.Lock()
-	totalSeen++
-	statsMu.Unlock()
-
-	avail := getAvailable()
-	if len(avail) == 0 {
-		fmt.Printf("   ❌ No takers\n")
-		return
-	}
-
-	type res struct {
-		id   int
-		code int
-		dur  time.Duration
-		err  error
-	}
-
-	ch := make(chan res, len(avail))
-	for _, t := range avail {
-		t.inUse.Store(true)
-		go func(tk *taker) {
-			code, dur, err := tk.take(id)
-			tk.inUse.Store(false)
-			if err != nil {
-				go tk.connect()
-			}
-			ch <- res{tk.id, code, dur, err}
-		}(t)
-	}
-
-	var results []res
-	for i := 0; i < len(avail); i++ {
-		results = append(results, <-ch)
-	}
-
-	sort.Slice(results, func(i, j int) bool { return results[i].dur < results[j].dur })
-
-	e2e := time.Since(detectTime).Milliseconds()
-	var parts []string
-	var won bool
-
-	for _, r := range results {
-		if r.err != nil {
-			parts = append(parts, fmt.Sprintf("T%d:ERR", r.id))
-			continue
-		}
-		s := fmt.Sprintf("T%d:%d", r.id, r.dur.Milliseconds())
-		if r.code == 200 {
-			s += "✓"
-			won = true
-		} else if r.code == 429 {
-			s += "(RATE)"
-		} else {
-			s += fmt.Sprintf("(%d)", r.code)
-		}
-		parts = append(parts, s)
-	}
-
-	if won {
-		statsMu.Lock()
-		totalWon++
-		statsMu.Unlock()
-		fmt.Printf("✅ [WS%02d] e2e=%dms amt=%s | %s\n", wsID, e2e, amt, strings.Join(parts, " "))
-		pauseTaking.Store(true)
-		go func() {
-			time.Sleep(pauseSeconds * time.Second)
-			pauseTaking.Store(false)
-			fmt.Println("▶ Resumed")
-		}()
-	} else {
-		statsMu.Lock()
-		totalLate++
-		statsMu.Unlock()
-		fmt.Printf("   [WS%02d] LATE e2e=%dms amt=%s | %s\n", wsID, e2e, amt, strings.Join(parts, " "))
-	}
-
-	go func() {
-		time.Sleep(3 * time.Second)
-		seenOrders.Delete(id)
-	}()
-}
-
-// ============ Parser ============
-
-var (
-	opAddBytes = []byte(`"op":"add"`)
-	idPrefix   = []byte(`"id":"`)
-	amtPrefix  = []byte(`"in_amount":"`)
-)
-
-func parseAndTake(data []byte, wsID int, detectTime time.Time, minCents int64) {
-	if !bytes.Contains(data, opAddBytes) {
-		return
-	}
-
-	idx := bytes.Index(data, idPrefix)
+	// Ищем ID напрямую в bytes
+	idx := bytes.Index(data, patternID)
 	if idx == -1 {
 		return
 	}
+
 	start := idx + 6
 	end := bytes.IndexByte(data[start:], '"')
 	if end == -1 || end > 30 {
 		return
 	}
-	id := string(data[start : start+end])
 
+	orderID := data[start : start+end] // []byte, не string!
+	orderIDStr := string(orderID)      // Только для dedupe
+
+	// Dedupe
+	if !markSeen(orderIDStr) {
+		return
+	}
+
+	totalSeen.Add(1)
+
+	// Парсим сумму параллельно (но не блокируем take!)
 	var amt string
-	idx = bytes.Index(data, amtPrefix)
-	if idx != -1 {
-		start = idx + 13
-		end = bytes.IndexByte(data[start:], '"')
-		if end != -1 && end < 20 {
-			amt = string(data[start : start+end])
+	if idx := bytes.Index(data, patternAmt); idx != -1 {
+		s := idx + 13
+		e := bytes.IndexByte(data[s:], '"')
+		if e != -1 && e < 20 {
+			amt = string(data[s : s+e])
 		}
 	}
 
+	// Фильтр по сумме
 	if minCents > 0 && amt != "" {
-		var whole, frac int64
-		var fracDigits int
-		var seenDot bool
-		for i := 0; i < len(amt); i++ {
-			c := amt[i]
-			if c == '.' {
-				seenDot = true
-				continue
-			}
-			if c >= '0' && c <= '9' {
-				d := int64(c - '0')
-				if !seenDot {
-					whole = whole*10 + d
-				} else if fracDigits < 2 {
-					frac = frac*10 + d
-					fracDigits++
-				}
-			}
-		}
-		if fracDigits == 1 {
-			frac *= 10
-		}
-		if whole*100+frac < minCents {
+		cents := parseCents(amt)
+		if cents < minCents {
 			return
 		}
 	}
 
-	doTake(id, amt, wsID, detectTime)
+	// 🚀 FIRE ALL TAKERS IMMEDIATELY (fire-and-forget)
+	fireTime := time.Now()
+	fired := 0
+
+	for _, t := range takers {
+		if t.ready.Load() {
+			if t.fireAndForget(orderID) {
+				fired++
+			}
+		}
+	}
+
+	fireLatency := time.Since(fireTime).Microseconds()
+
+	// Читаем ответы в фоне
+	go func() {
+		var results []string
+		var won bool
+
+		for _, t := range takers {
+			if !t.ready.Load() {
+				continue
+			}
+
+			code, err := t.readResponse()
+			if err != nil {
+				results = append(results, fmt.Sprintf("T%d:ERR", t.id))
+				go t.connect()
+				continue
+			}
+
+			if code == 200 {
+				results = append(results, fmt.Sprintf("T%d:OK", t.id))
+				won = true
+			} else {
+				results = append(results, fmt.Sprintf("T%d:%d", t.id, code))
+			}
+		}
+
+		e2e := time.Since(detectTime).Milliseconds()
+
+		if won {
+			totalWon.Add(1)
+			fmt.Printf("✅ [WS%02d] e2e=%dms fire=%dμs amt=%s | %s\n",
+				wsID, e2e, fireLatency, amt, strings.Join(results, " "))
+			pauseTaking.Store(true)
+			time.Sleep(pauseSeconds * time.Second)
+			pauseTaking.Store(false)
+			fmt.Println("▶ Resumed")
+		} else {
+			totalLate.Add(1)
+			fmt.Printf("   [WS%02d] LATE e2e=%dms fire=%dμs amt=%s fired=%d | %s\n",
+				wsID, e2e, fireLatency, amt, fired, strings.Join(results, " "))
+		}
+	}()
+}
+
+func parseCents(amt string) int64 {
+	var whole, frac int64
+	var fracDigits int
+	var seenDot bool
+
+	for i := 0; i < len(amt); i++ {
+		c := amt[i]
+		if c == '.' {
+			seenDot = true
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			d := int64(c - '0')
+			if !seenDot {
+				whole = whole*10 + d
+			} else if fracDigits < 2 {
+				frac = frac*10 + d
+				fracDigits++
+			}
+		}
+	}
+
+	if fracDigits == 1 {
+		frac *= 10
+	}
+
+	return whole*100 + frac
 }
 
 // ============ WebSocket ============
@@ -389,6 +387,7 @@ func runWS(wsID int, minCents int64) {
 			continue
 		}
 
+		// Handshake
 		readFrame(conn)
 		writeFrame(conn, []byte("40"))
 		readFrame(conn)
@@ -402,7 +401,7 @@ func runWS(wsID int, minCents int64) {
 
 		for {
 			data, op, err := readFrame(conn)
-			detectTime := time.Now()
+			detectTime := time.Now() // Timestamp СРАЗУ после получения фрейма
 
 			if err != nil {
 				break
@@ -413,8 +412,9 @@ func runWS(wsID int, minCents int64) {
 					writeFrame(conn, []byte("3"))
 					continue
 				}
-				if len(data) > 2 && data[0] == '4' && data[1] == '2' {
-					parseAndTake(data[2:], wsID, detectTime, minCents)
+				if len(data) > 10 && data[0] == '4' && data[1] == '2' {
+					// 🚀 INSTANT TRIGGER
+					ultraFastTake(data[2:], wsID, detectTime, minCents)
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -480,7 +480,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - 2 Takers (Rate Limited)     ║")
+	fmt.Println("║  ULTRA SNIPER - Fire & Forget             ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -509,14 +509,14 @@ func main() {
 	serverIP = ips[0]
 	fmt.Printf("✅ Server IP: %s\n", serverIP)
 
+	// Pre-build request (zero alloc on hot path)
 	reqPrefix = []byte("POST " + takePathPrefix)
 	reqSuffix = []byte(" HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: application/json\r\nCookie: " + cookie + "\r\nContent-Length: 2\r\n\r\n{}")
 
-	// Create 2 takers
+	// Create takers
 	fmt.Printf("\n⏳ Creating %d takers...\n", numTakers)
 	for i := 0; i < numTakers; i++ {
 		t := &taker{id: i + 1}
-		t.lastRtt.Store(999999)
 		t.connect()
 		takers = append(takers, t)
 	}
@@ -529,16 +529,15 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d takers ready\n", ready, numTakers)
 
-	// Warmup goroutines (HEAD - no rate limit)
+	// Warmup goroutines
 	for i, t := range takers {
 		go func(idx int, tk *taker) {
-			// Stagger
 			time.Sleep(time.Duration(idx*50) * time.Millisecond)
 			for {
-				time.Sleep(200 * time.Millisecond) // Агрессивнее - 200ms
-				if !tk.inUse.Load() && tk.ready.Load() {
+				time.Sleep(200 * time.Millisecond)
+				if tk.ready.Load() {
 					tk.warmup()
-				} else if !tk.ready.Load() {
+				} else {
 					tk.connect()
 				}
 			}
@@ -553,7 +552,8 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | warmup via POST /accounts (200ms)\n", numWebSockets, numTakers)
+	fmt.Printf("  %d WS | %d takers | FIRE-AND-FORGET mode\n", numWebSockets, numTakers)
+	fmt.Println("  🔥 Requests sent BEFORE waiting for response")
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
@@ -563,18 +563,16 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(60 * time.Second)
-			statsMu.Lock()
-			rate := float64(totalWon) / float64(max(totalSeen, 1)) * 100
-			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%%)\n\n",
-				totalSeen, totalWon, totalLate, rate)
-			statsMu.Unlock()
+			s, w, l := totalSeen.Load(), totalWon.Load(), totalLate.Load()
+			rate := float64(w) / float64(max(s, 1)) * 100
+			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%%)\n\n", s, w, l, rate)
 		}
 	}()
 
 	select {}
 }
 
-func max(a, b int) int {
+func max(a, b int64) int64 {
 	if a > b {
 		return a
 	}
