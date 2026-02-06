@@ -291,15 +291,12 @@ func ultraFastTake(data []byte, wsID int, detectTime time.Time, minCents int64) 
 		}
 	}
 
-	// 🚀 FIRE ALL TAKERS IMMEDIATELY (fire-and-forget)
+	// 🚀 FIRE ALL TAKERS IN PARALLEL (no waiting at all)
 	fireTime := time.Now()
-	fired := 0
 
 	for _, t := range takers {
 		if t.ready.Load() {
-			if t.fireAndForget(orderID) {
-				fired++
-			}
+			go t.fireAndForget(orderID)
 		}
 	}
 
@@ -342,8 +339,8 @@ func ultraFastTake(data []byte, wsID int, detectTime time.Time, minCents int64) 
 			fmt.Println("▶ Resumed")
 		} else {
 			totalLate.Add(1)
-			fmt.Printf("   [WS%02d] LATE e2e=%dms fire=%dμs amt=%s fired=%d | %s\n",
-				wsID, e2e, fireLatency, amt, fired, strings.Join(results, " "))
+			fmt.Printf("   [WS%02d] LATE e2e=%dms fire=%dμs amt=%s | %s\n",
+				wsID, e2e, fireLatency, amt, strings.Join(results, " "))
 		}
 	}()
 }
@@ -553,7 +550,7 @@ func main() {
 
 	fmt.Println("\n════════════════════════════════════════════")
 	fmt.Printf("  %d WS | %d takers | FIRE-AND-FORGET mode\n", numWebSockets, numTakers)
-	fmt.Println("  🔥 Requests sent BEFORE waiting for response")
+	fmt.Println("  🔥 All takers fire in TRUE parallel")
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
