@@ -32,7 +32,7 @@ const (
 	pauseSeconds   = 20
 )
 
-const numClients = 5
+const numClients = 15
 const numWebSockets = 5
 const parallelTakes = 5
 
@@ -40,18 +40,6 @@ var (
 	pauseTaking atomic.Bool
 	seenOrders  sync.Map
 )
-
-// ============ Order Event ============
-
-type orderEvent struct {
-	id      string
-	amtStr  string
-	wsID    int
-	wsTime  time.Time
-	handled atomic.Bool
-}
-
-var pendingOrders sync.Map
 
 // ============ HTTP Client Pool ============
 
@@ -64,6 +52,7 @@ type httpClient struct {
 	name     string
 	lastUsed time.Time
 	inUse    atomic.Bool
+	lastRtt  atomic.Uint64
 
 	// Stats
 	totalRequests atomic.Uint64
@@ -71,7 +60,6 @@ type httpClient struct {
 	minLatency    atomic.Uint64
 	maxLatency    atomic.Uint64
 	wins          atomic.Uint64
-	lastRtt       atomic.Uint64
 }
 
 var (
@@ -83,6 +71,7 @@ func newHTTPClient(name string) *httpClient {
 	c := &httpClient{name: name}
 	c.ready.Store(false)
 	c.minLatency.Store(999999999)
+	c.lastRtt.Store(999999)
 	return c
 }
 
@@ -254,7 +243,6 @@ func (c *httpClient) doTake(orderID string) (int, time.Duration, error) {
 	c.lastUsed = time.Now()
 	c.lastRtt.Store(uint64(dur.Milliseconds()))
 
-	// Update stats
 	c.totalRequests.Add(1)
 	latMs := uint64(dur.Milliseconds())
 	c.totalLatency.Add(latMs)
@@ -284,7 +272,35 @@ func (c *httpClient) avgLatency() uint64 {
 	return c.totalLatency.Load() / total
 }
 
-// ============ Parallel Takes ============
+// Получить 5 лучших клиентов по lastRtt
+func getBestClients(count int) []*httpClient {
+	type clientScore struct {
+		client *httpClient
+		rtt    uint64
+	}
+
+	var available []clientScore
+	for i := 0; i < numClients; i++ {
+		c := clients[i]
+		if c.ready.Load() && !c.inUse.Load() {
+			available = append(available, clientScore{c, c.lastRtt.Load()})
+		}
+	}
+
+	// Сортируем по RTT
+	sort.Slice(available, func(i, j int) bool {
+		return available[i].rtt < available[j].rtt
+	})
+
+	var result []*httpClient
+	for i := 0; i < len(available) && i < count; i++ {
+		result = append(result, available[i].client)
+	}
+
+	return result
+}
+
+// ============ Instant Parallel Takes ============
 
 type takeResult struct {
 	client *httpClient
@@ -293,35 +309,40 @@ type takeResult struct {
 	err    error
 }
 
-func parallelTake(ev *orderEvent) {
+func instantParallelTake(id, amtStr string, wsID int, wsTime time.Time) {
 	if pauseTaking.Load() {
 		return
 	}
 
-	if !ev.handled.CompareAndSwap(false, true) {
+	// Проверяем дедупликацию
+	if _, loaded := seenOrders.LoadOrStore(id, wsTime); loaded {
 		return
 	}
 
-	results := make(chan takeResult, parallelTakes)
+	// Получаем 5 лучших клиентов СРАЗУ
+	bestClients := getBestClients(parallelTakes)
+	if len(bestClients) == 0 {
+		fmt.Printf("   ❌ NO READY CLIENTS\n")
+		return
+	}
+
+	fmt.Printf("📥 [WS%d] NEW: %s amt=%s (using %d clients)\n", wsID, id, amtStr, len(bestClients))
+
+	results := make(chan takeResult, len(bestClients))
 	var wg sync.WaitGroup
 
-	for i := 0; i < parallelTakes; i++ {
-		c := clients[i]
-		if !c.ready.Load() {
-			continue
-		}
-
+	// Запускаем ВСЕ параллельно СРАЗУ
+	for _, c := range bestClients {
+		c.inUse.Store(true)
 		wg.Add(1)
 		go func(client *httpClient) {
 			defer wg.Done()
-			client.inUse.Store(true)
-			code, dur, err := client.doTake(ev.id)
-			client.inUse.Store(false)
+			defer client.inUse.Store(false)
 
+			code, dur, err := client.doTake(id)
 			if err != nil {
 				go client.connect()
 			}
-
 			results <- takeResult{client, code, dur, err}
 		}(c)
 	}
@@ -331,6 +352,7 @@ func parallelTake(ev *orderEvent) {
 		close(results)
 	}()
 
+	// Собираем результаты
 	var allResults []takeResult
 	for r := range results {
 		allResults = append(allResults, r)
@@ -340,7 +362,7 @@ func parallelTake(ev *orderEvent) {
 		return allResults[i].dur < allResults[j].dur
 	})
 
-	e2eMs := time.Since(ev.wsTime).Milliseconds()
+	e2eMs := time.Since(wsTime).Milliseconds()
 
 	var winner *takeResult
 	var rttDetails []string
@@ -366,7 +388,7 @@ func parallelTake(ev *orderEvent) {
 
 	if winner != nil {
 		fmt.Printf("✅ TAKEN [WS%d] e2e=%dms | %s | id=%s amt=%s\n",
-			ev.wsID, e2eMs, strings.Join(rttDetails, " "), ev.id, ev.amtStr)
+			wsID, e2eMs, strings.Join(rttDetails, " "), id, amtStr)
 
 		pauseTaking.Store(true)
 		go func() {
@@ -378,7 +400,13 @@ func parallelTake(ev *orderEvent) {
 	}
 
 	fmt.Printf("   LATE [WS%d] e2e=%dms | %s | id=%s\n",
-		ev.wsID, e2eMs, strings.Join(rttDetails, " "), ev.id)
+		wsID, e2eMs, strings.Join(rttDetails, " "), id)
+
+	// Cleanup
+	go func() {
+		time.Sleep(5 * time.Second)
+		seenOrders.Delete(id)
+	}()
 }
 
 // ============ Speculative Parser ============
@@ -458,30 +486,8 @@ func speculativeParse(msg []byte, wsTime time.Time, wsID int, minCents int64) {
 		}
 	}
 
-	ev := &orderEvent{
-		id:     id,
-		amtStr: amtStr,
-		wsID:   wsID,
-		wsTime: wsTime,
-	}
-
-	existing, loaded := pendingOrders.LoadOrStore(id, ev)
-	if loaded {
-		existingEv := existing.(*orderEvent)
-		delay := wsTime.Sub(existingEv.wsTime)
-		if delay > time.Millisecond {
-			fmt.Printf("   [WS%d] +%v (WS%d first)\n", wsID, delay.Round(100*time.Microsecond), existingEv.wsID)
-		}
-		return
-	}
-
-	fmt.Printf("📥 [WS%d] NEW: %s amt=%s\n", wsID, id, amtStr)
-	parallelTake(ev)
-
-	go func() {
-		time.Sleep(5 * time.Second)
-		pendingOrders.Delete(id)
-	}()
+	// СРАЗУ запускаем take - не ждём другие WS!
+	go instantParallelTake(id, amtStr, wsID, wsTime)
 }
 
 // ============ WebSocket ============
@@ -630,6 +636,7 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 				}
 
 				if len(payload) > 2 && payload[0] == '4' && payload[1] == '2' {
+					// Парсим и запускаем СРАЗУ в горутине
 					msgCopy := make([]byte, len(payload)-2)
 					copy(msgCopy, payload[2:])
 					go speculativeParse(msgCopy, wsTime, wsID, minCents)
@@ -653,21 +660,44 @@ func runWebSocket(wsID int, cookie string, minCents int64, wg *sync.WaitGroup) {
 }
 
 func printStats() {
-	fmt.Println("\n📊 CLIENT STATS:")
+	fmt.Println("\n📊 CLIENT STATS (sorted by lastRtt):")
 	fmt.Println("────────────────────────────────────────────")
+
+	type stat struct {
+		name    string
+		reqs    uint64
+		avg     uint64
+		min     uint64
+		max     uint64
+		wins    uint64
+		lastRtt uint64
+	}
+
+	var stats []stat
 	for i := 0; i < numClients; i++ {
 		c := clients[i]
-		total := c.totalRequests.Load()
-		if total == 0 {
-			fmt.Printf("   %s: no requests yet | lastRtt=%dms\n", c.name, c.lastRtt.Load())
-			continue
-		}
 		minLat := c.minLatency.Load()
 		if minLat == 999999999 {
 			minLat = 0
 		}
-		fmt.Printf("   %s: reqs=%d avg=%dms min=%dms max=%dms wins=%d | lastRtt=%dms\n",
-			c.name, total, c.avgLatency(), minLat, c.maxLatency.Load(), c.wins.Load(), c.lastRtt.Load())
+		stats = append(stats, stat{
+			name:    c.name,
+			reqs:    c.totalRequests.Load(),
+			avg:     c.avgLatency(),
+			min:     minLat,
+			max:     c.maxLatency.Load(),
+			wins:    c.wins.Load(),
+			lastRtt: c.lastRtt.Load(),
+		})
+	}
+
+	sort.Slice(stats, func(i, j int) bool {
+		return stats[i].lastRtt < stats[j].lastRtt
+	})
+
+	for _, s := range stats {
+		fmt.Printf("   %s: lastRtt=%3dms | reqs=%d avg=%dms min=%dms max=%dms wins=%d\n",
+			s.name, s.lastRtt, s.reqs, s.avg, s.min, s.max, s.wins)
 	}
 	fmt.Println("────────────────────────────────────────────")
 }
@@ -678,7 +708,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - Ultra Aggressive Warmup     ║")
+	fmt.Println("║  P2C SNIPER - 15 Clients, Best 5 Takes    ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 	fmt.Println()
 
@@ -706,13 +736,18 @@ func main() {
 	fmt.Println()
 	fmt.Printf("⏳ Connecting %d HTTP clients...\n", numClients)
 
+	var connectWg sync.WaitGroup
 	for i := 0; i < numClients; i++ {
-		clients[i] = newHTTPClient(fmt.Sprintf("C%d", i+1))
-		if err := clients[i].connect(); err == nil {
-			clients[i].warmup()
-		}
-		time.Sleep(30 * time.Millisecond)
+		clients[i] = newHTTPClient(fmt.Sprintf("C%02d", i+1))
+		connectWg.Add(1)
+		go func(c *httpClient) {
+			defer connectWg.Done()
+			if err := c.connect(); err == nil {
+				c.warmup()
+			}
+		}(clients[i])
 	}
+	connectWg.Wait()
 
 	ready := 0
 	for i := 0; i < numClients; i++ {
@@ -722,10 +757,13 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d HTTP clients ready\n", ready, numClients)
 
-	// ULTRA AGGRESSIVE warmup - каждый клиент каждую секунду!
+	// Warmup - каждый клиент каждую секунду
 	for i := 0; i < numClients; i++ {
 		go func(idx int) {
 			c := clients[idx]
+			// Стаггеринг чтобы не все одновременно
+			time.Sleep(time.Duration(idx*67) * time.Millisecond)
+
 			for {
 				time.Sleep(1 * time.Second)
 
@@ -743,8 +781,6 @@ func main() {
 					c.ready.Store(false)
 					c.connect()
 				} else if dur > 500*time.Millisecond {
-					// Слишком медленно - переподключаемся
-					fmt.Printf("   [%s] warmup slow (%dms), reconnecting\n", c.name, dur.Milliseconds())
 					c.ready.Store(false)
 					c.connect()
 				}
@@ -768,13 +804,13 @@ func main() {
 	for i := 1; i <= numWebSockets; i++ {
 		wsWg.Add(1)
 		go runWebSocket(i, accessCookie, minCents, &wsWg)
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	fmt.Println()
 	fmt.Println("════════════════════════════════════════════")
-	fmt.Println("  Warmup: every 1 second per client")
-	fmt.Println("  Auto-reconnect if warmup > 500ms")
+	fmt.Println("  15 HTTP clients, 5 best used per take")
+	fmt.Println("  First WS triggers instant parallel takes")
 	fmt.Println("════════════════════════════════════════════")
 	fmt.Println()
 
