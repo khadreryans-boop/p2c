@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gobwas/ws"
-	"golang.org/x/net/http2"
 	nh "nhooyr.io/websocket"
 )
 
@@ -26,11 +25,12 @@ const (
 )
 
 var cookie string
+var serverIP string
 
 // Track results
 var (
 	mu         sync.Mutex
-	orderFirst = make(map[string]string) // order_id -> "H1-X" or "H2-X"
+	orderFirst = make(map[string]string)
 	orderTime  = make(map[string]time.Time)
 	h1Wins     int
 	h2Wins     int
@@ -60,18 +60,17 @@ func recordOrder(orderID, source string) {
 
 // ============ HTTP/1.1 WebSocket (gobwas/ws) ============
 
-func runWSHttp1(id int, ip string) {
+func runWSHttp1(id int) {
 	source := fmt.Sprintf("H1-%d", id)
 
 	for {
-		conn, err := connectWSHttp1(ip)
+		conn, err := connectWSHttp1()
 		if err != nil {
 			fmt.Printf("[%s] connect err: %v\n", source, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// Handshake
 		readFrame(conn)
 		writeFrame(conn, []byte("40"))
 		readFrame(conn)
@@ -111,7 +110,7 @@ func runWSHttp1(id int, ip string) {
 	}
 }
 
-func connectWSHttp1(ip string) (net.Conn, error) {
+func connectWSHttp1() (net.Conn, error) {
 	dialer := ws.Dialer{
 		Header: ws.HandshakeHeaderHTTP(http.Header{
 			"Cookie": []string{cookie},
@@ -119,7 +118,7 @@ func connectWSHttp1(ip string) (net.Conn, error) {
 		}),
 		Timeout: 10 * time.Second,
 		NetDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := net.DialTimeout("tcp", ip+":443", 5*time.Second)
+			conn, err := net.DialTimeout("tcp", serverIP+":443", 5*time.Second)
 			if err != nil {
 				return nil, err
 			}
@@ -160,23 +159,33 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 func runWSHttp2(id int) {
 	source := fmt.Sprintf("H2-%d", id)
 
-	// HTTP/2 transport
-	transport := &http2.Transport{
-		TLSClientConfig: &tls.Config{
-			ServerName: host,
-			NextProtos: []string{"h2"},
-		},
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
-
 	for {
 		ctx := context.Background()
 
-		// Добавляем cookie в header
+		// Transport с HTTP/2
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := net.DialTimeout("tcp", serverIP+":443", 5*time.Second)
+				if err != nil {
+					return nil, err
+				}
+				if tc, ok := conn.(*net.TCPConn); ok {
+					tc.SetNoDelay(true)
+				}
+				return conn, nil
+			},
+			TLSClientConfig: &tls.Config{
+				ServerName: host,
+				NextProtos: []string{"h2", "http/1.1"},
+			},
+			ForceAttemptHTTP2: true,
+		}
+
+		httpClient := &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+		}
+
 		header := http.Header{}
 		header.Set("Cookie", cookie)
 		header.Set("Origin", "https://app.send.tg")
@@ -187,10 +196,11 @@ func runWSHttp2(id int) {
 		})
 
 		if err != nil {
-			fmt.Printf("[%s] connect err: %v\n", source, err)
+			proto := ""
 			if resp != nil {
-				fmt.Printf("[%s] HTTP status: %d, Proto: %s\n", source, resp.StatusCode, resp.Proto)
+				proto = resp.Proto
 			}
+			fmt.Printf("[%s] connect err (%s): %v\n", source, proto, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -200,23 +210,19 @@ func runWSHttp2(id int) {
 			proto = resp.Proto
 		}
 
-		// Handshake - read Engine.IO open
+		// Handshake
 		_, data, err := conn.Read(ctx)
 		if err != nil {
-			fmt.Printf("[%s] read open err: %v\n", source, err)
 			conn.Close(nh.StatusNormalClosure, "")
 			time.Sleep(2 * time.Second)
 			continue
 		}
 		_ = data
 
-		// Send Socket.IO connect
 		conn.Write(ctx, nh.MessageText, []byte("40"))
 
-		// Read connect ack
 		_, _, err = conn.Read(ctx)
 		if err != nil {
-			fmt.Printf("[%s] read ack err: %v\n", source, err)
 			conn.Close(nh.StatusNormalClosure, "")
 			time.Sleep(2 * time.Second)
 			continue
@@ -294,19 +300,19 @@ func main() {
 		fmt.Printf("DNS error: %v\n", err)
 		return
 	}
-	ip := ips[0]
-	fmt.Printf("✅ Using IP: %s\n", ip)
+	serverIP = ips[0]
+	fmt.Printf("✅ Using IP: %s\n", serverIP)
 
-	// Start 5 HTTP/1.1 WebSockets
+	// Start HTTP/1.1 WebSockets
 	fmt.Println("\n⏳ Starting 5 HTTP/1.1 WebSockets...")
 	for i := 1; i <= 5; i++ {
-		go runWSHttp1(i, ip)
+		go runWSHttp1(i)
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	time.Sleep(1 * time.Second)
 
-	// Start 5 HTTP/2 WebSockets
+	// Start HTTP/2 WebSockets
 	fmt.Println("⏳ Starting 5 HTTP/2 WebSockets...")
 	for i := 1; i <= 5; i++ {
 		go runWSHttp2(i)
@@ -318,7 +324,7 @@ func main() {
 	fmt.Println("  🥇 = first to see order")
 	fmt.Println("════════════════════════════════════════════\n")
 
-	// Stats every 60 sec
+	// Stats
 	go func() {
 		for {
 			time.Sleep(60 * time.Second)
