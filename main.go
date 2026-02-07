@@ -321,13 +321,14 @@ func handleOrder(orderID, amt string, wsID int, detectTime time.Time) {
 		}(c)
 	}
 
+	fireLatency := time.Since(fireTime).Microseconds() // Только spawn goroutines
+
 	// Collect results
 	var results []result
 	for range topClients {
 		results = append(results, <-ch)
 	}
 
-	fireLatency := time.Since(fireTime).Microseconds()
 	e2e := time.Since(detectTime).Milliseconds()
 
 	// Format output
