@@ -175,13 +175,19 @@ func runWsocatWS() {
 }
 
 func runWsocatSession() error {
-	// websocat with headers
-	cmd := exec.Command("websocat", "-t",
-		"--header", "Cookie: "+cookie,
-		"--header", "Origin: https://app.send.tg",
+	// websocat with headers - use -H for headers, no -t
+	cmd := exec.Command("websocat", "-v",
+		"-H", "Cookie: "+cookie,
+		"-H", "Origin: https://app.send.tg",
+		"--no-close",
 		wsURL)
 
 	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return err
 	}
@@ -194,6 +200,14 @@ func runWsocatSession() error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+
+	// Log stderr in background
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			fmt.Printf("[WSOCAT-DBG] %s\n", scanner.Text())
+		}
+	}()
 
 	defer func() {
 		stdin.Close()
@@ -208,7 +222,7 @@ func runWsocatSession() error {
 	if err != nil {
 		return fmt.Errorf("read open: %v", err)
 	}
-	_ = line
+	fmt.Printf("[WSOCAT] got: %s\n", strings.TrimSpace(line))
 
 	// Send Socket.IO connect
 	stdin.Write([]byte("40\n"))
