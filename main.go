@@ -79,6 +79,7 @@ type taker struct {
 	bw    *bufio.Writer
 	mu    sync.Mutex
 	ready atomic.Bool
+	inUse atomic.Bool // Занят take/warmup
 	id    int
 }
 
@@ -118,70 +119,18 @@ func (t *taker) connect() error {
 	return nil
 }
 
-// Fire-and-forget: отправляем и НЕ ЖДЁМ ответа
-func (t *taker) fireAndForget(orderID []byte) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// (fireAndForget removed - logic inlined)
 
-	if t.conn == nil {
-		return false
-	}
-
-	t.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-
-	// Пишем запрос напрямую без аллокаций
-	t.bw.Write(reqPrefix)
-	t.bw.Write(orderID)
-	t.bw.Write(reqSuffix)
-
-	if err := t.bw.Flush(); err != nil {
-		t.conn.Close()
-		t.conn = nil
-		t.ready.Store(false)
-		return false
-	}
-
-	return true
-}
-
-// Читаем ответ отдельно (в фоне)
-func (t *taker) readResponse() (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.conn == nil {
-		return 0, fmt.Errorf("no conn")
-	}
-
-	t.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-	line, err := t.br.ReadString('\n')
-	if err != nil {
-		t.conn.Close()
-		t.conn = nil
-		t.ready.Store(false)
-		return 0, err
-	}
-
-	if len(line) < 12 {
-		return 0, fmt.Errorf("short")
-	}
-
-	code, _ := strconv.Atoi(line[9:12])
-
-	// Drain
-	for {
-		line, _ := t.br.ReadString('\n')
-		if line == "\r\n" || line == "" {
-			break
-		}
-	}
-
-	return code, nil
-}
+// (readResponse removed - logic inlined)
 
 // Warmup
 func (t *taker) warmup() {
+	// Не делаем warmup если занят
+	if !t.inUse.CompareAndSwap(false, true) {
+		return
+	}
+	defer t.inUse.Store(false)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -189,7 +138,7 @@ func (t *taker) warmup() {
 		return
 	}
 
-	t.conn.SetDeadline(time.Now().Add(2 * time.Second))
+	t.conn.SetDeadline(time.Now().Add(1 * time.Second))
 
 	req := "POST /internal/v1/p2c/accounts HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -291,58 +240,142 @@ func ultraFastTake(data []byte, wsID int, detectTime time.Time, minCents int64) 
 		}
 	}
 
-	// 🚀 FIRE ALL TAKERS IN PARALLEL (no waiting at all)
+	// 🚀 FIRE ALL AVAILABLE TAKERS
 	fireTime := time.Now()
 
+	// Собираем доступные takers
+	var available []*taker
 	for _, t := range takers {
-		if t.ready.Load() {
-			go t.fireAndForget(orderID)
+		if t.ready.Load() && t.inUse.CompareAndSwap(false, true) {
+			available = append(available, t)
 		}
 	}
 
+	if len(available) == 0 {
+		totalLate.Add(1)
+		fmt.Printf("   [WS%02d] NO TAKERS amt=%s\n", wsID, amt)
+		return
+	}
+
+	// Fire все параллельно
+	var wg sync.WaitGroup
+	for _, t := range available {
+		wg.Add(1)
+		go func(tk *taker) {
+			defer wg.Done()
+			tk.mu.Lock()
+			if tk.conn != nil {
+				tk.conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+				tk.bw.Write(reqPrefix)
+				tk.bw.Write(orderID)
+				tk.bw.Write(reqSuffix)
+				tk.bw.Flush()
+			}
+			tk.mu.Unlock()
+		}(t)
+	}
+	wg.Wait()
+
 	fireLatency := time.Since(fireTime).Microseconds()
 
-	// Читаем ответы в фоне
-	go func() {
-		var results []string
-		var won bool
+	// Читаем ответы ПАРАЛЛЕЛЬНО
+	type result struct {
+		id   int
+		code int
+		err  bool
+		dur  time.Duration
+	}
 
-		for _, t := range takers {
-			if !t.ready.Load() {
-				continue
+	resultCh := make(chan result, len(available))
+
+	for _, t := range available {
+		go func(tk *taker) {
+			start := time.Now()
+			tk.mu.Lock()
+
+			if tk.conn == nil {
+				tk.mu.Unlock()
+				tk.inUse.Store(false)
+				resultCh <- result{tk.id, 0, true, time.Since(start)}
+				go tk.connect()
+				return
 			}
 
-			code, err := t.readResponse()
-			if err != nil {
-				results = append(results, fmt.Sprintf("T%d:ERR", t.id))
-				go t.connect()
-				continue
+			tk.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			line, err := tk.br.ReadString('\n')
+
+			if err != nil || len(line) < 12 {
+				tk.conn.Close()
+				tk.conn = nil
+				tk.ready.Store(false)
+				tk.mu.Unlock()
+				tk.inUse.Store(false)
+				resultCh <- result{tk.id, 0, true, time.Since(start)}
+				go tk.connect()
+				return
 			}
 
-			if code == 200 {
-				results = append(results, fmt.Sprintf("T%d:OK", t.id))
-				won = true
-			} else {
-				results = append(results, fmt.Sprintf("T%d:%d", t.id, code))
+			code, _ := strconv.Atoi(line[9:12])
+
+			// Drain
+			for {
+				l, _ := tk.br.ReadString('\n')
+				if l == "\r\n" || l == "" {
+					break
+				}
 			}
+
+			tk.mu.Unlock()
+			tk.inUse.Store(false)
+			resultCh <- result{tk.id, code, false, time.Since(start)}
+		}(t)
+	}
+
+	// Собираем результаты
+	var results []result
+	for range available {
+		results = append(results, <-resultCh)
+	}
+
+	// Находим первый ответ (минимальное время)
+	var firstResponseTime time.Duration = 999 * time.Second
+	for _, r := range results {
+		if r.dur < firstResponseTime {
+			firstResponseTime = r.dur
 		}
+	}
 
-		e2e := time.Since(detectTime).Milliseconds()
+	e2e := time.Since(detectTime).Milliseconds()
+	firstResp := firstResponseTime.Milliseconds()
 
-		if won {
-			totalWon.Add(1)
-			fmt.Printf("✅ [WS%02d] e2e=%dms fire=%dμs amt=%s | %s\n",
-				wsID, e2e, fireLatency, amt, strings.Join(results, " "))
-			pauseTaking.Store(true)
+	var parts []string
+	var won bool
+	for _, r := range results {
+		if r.err {
+			parts = append(parts, fmt.Sprintf("T%d:ERR", r.id))
+		} else if r.code == 200 {
+			parts = append(parts, fmt.Sprintf("T%d:OK", r.id))
+			won = true
+		} else {
+			parts = append(parts, fmt.Sprintf("T%d:%d", r.id, r.code))
+		}
+	}
+
+	if won {
+		totalWon.Add(1)
+		fmt.Printf("✅ [WS%02d] e2e=%dms first=%dms fire=%dμs amt=%s | %s\n",
+			wsID, e2e, firstResp, fireLatency, amt, strings.Join(parts, " "))
+		pauseTaking.Store(true)
+		go func() {
 			time.Sleep(pauseSeconds * time.Second)
 			pauseTaking.Store(false)
 			fmt.Println("▶ Resumed")
-		} else {
-			totalLate.Add(1)
-			fmt.Printf("   [WS%02d] LATE e2e=%dms fire=%dμs amt=%s | %s\n",
-				wsID, e2e, fireLatency, amt, strings.Join(results, " "))
-		}
-	}()
+		}()
+	} else {
+		totalLate.Add(1)
+		fmt.Printf("   [WS%02d] LATE e2e=%dms first=%dms fire=%dμs amt=%s | %s\n",
+			wsID, e2e, firstResp, fireLatency, amt, strings.Join(parts, " "))
+	}
 }
 
 func parseCents(amt string) int64 {
@@ -526,12 +559,12 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d takers ready\n", ready, numTakers)
 
-	// Warmup goroutines
+	// Warmup goroutines - АГРЕССИВНО
 	for i, t := range takers {
 		go func(idx int, tk *taker) {
-			time.Sleep(time.Duration(idx*50) * time.Millisecond)
+			time.Sleep(time.Duration(idx*20) * time.Millisecond)
 			for {
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond) // Каждые 100ms
 				if tk.ready.Load() {
 					tk.warmup()
 				} else {
@@ -549,8 +582,8 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | FIRE-AND-FORGET mode\n", numWebSockets, numTakers)
-	fmt.Println("  🔥 All takers fire in TRUE parallel")
+	fmt.Printf("  %d WS | %d takers | warmup 100ms\n", numWebSockets, numTakers)
+	fmt.Println("  🔥 Parallel fire, async response read")
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
