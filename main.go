@@ -29,6 +29,7 @@ const (
 const (
 	numWebSockets = 20
 	numTakers     = 5
+	warmupMs      = 1000 // Warmup interval
 )
 
 var (
@@ -37,7 +38,6 @@ var (
 	serverIP    string
 )
 
-// Pre-built request
 var reqPrefix []byte
 var reqSuffix []byte
 
@@ -46,6 +46,23 @@ var (
 	seenMu sync.Mutex
 	seen   = make(map[string]struct{})
 )
+
+func markSeen(id string) bool {
+	seenMu.Lock()
+	if _, ok := seen[id]; ok {
+		seenMu.Unlock()
+		return false
+	}
+	seen[id] = struct{}{}
+	seenMu.Unlock()
+	go func() {
+		time.Sleep(5 * time.Second)
+		seenMu.Lock()
+		delete(seen, id)
+		seenMu.Unlock()
+	}()
+	return true
+}
 
 // Stats
 var (
@@ -115,7 +132,7 @@ func (t *taker) warmup() {
 		return
 	}
 
-	t.conn.SetDeadline(time.Now().Add(1 * time.Second))
+	t.conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
 
 	req := "POST /internal/v1/p2c/accounts HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -141,42 +158,80 @@ func (t *taker) warmup() {
 	}
 	_ = line
 
-	// Drain headers + body
+	// Drain headers
 	contentLen := 0
 	for {
-		l, _ := t.br.ReadString('\n')
-		if l == "\r\n" || l == "" {
+		line, _ = t.br.ReadString('\n')
+		if line == "\r\n" || line == "" {
 			break
 		}
-		if strings.HasPrefix(strings.ToLower(l), "content-length:") {
-			fmt.Sscanf(l[15:], "%d", &contentLen)
+		if strings.HasPrefix(strings.ToLower(line), "content-length:") {
+			fmt.Sscanf(line[15:], "%d", &contentLen)
 		}
 	}
+
 	if contentLen > 0 {
-		io.CopyN(io.Discard, t.br, int64(contentLen))
+		body := make([]byte, contentLen)
+		io.ReadFull(t.br, body)
 	}
 }
 
-// ============ Take Logic ============
+// ============ Ultra-fast Take ============
 
-func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
+var (
+	patternOpAdd = []byte(`"op":"add"`)
+	patternID    = []byte(`"id":"`)
+	patternAmt   = []byte(`"in_amount":"`)
+)
+
+func ultraFastTake(data []byte, wsID int, detectTime time.Time, minCents int64) {
 	if pauseTaking.Load() {
 		return
 	}
 
-	orderIDStr := string(orderID)
-
-	seenMu.Lock()
-	if _, ok := seen[orderIDStr]; ok {
-		seenMu.Unlock()
+	if !bytes.Contains(data, patternOpAdd) {
 		return
 	}
-	seen[orderIDStr] = struct{}{}
-	seenMu.Unlock()
+
+	idx := bytes.Index(data, patternID)
+	if idx == -1 {
+		return
+	}
+
+	start := idx + 6
+	end := bytes.IndexByte(data[start:], '"')
+	if end == -1 || end > 30 {
+		return
+	}
+
+	orderID := data[start : start+end]
+	orderIDStr := string(orderID)
+
+	if !markSeen(orderIDStr) {
+		return
+	}
 
 	totalSeen.Add(1)
 
-	// Grab available takers
+	var amt string
+	if idx := bytes.Index(data, patternAmt); idx != -1 {
+		s := idx + 13
+		e := bytes.IndexByte(data[s:], '"')
+		if e != -1 && e < 20 {
+			amt = string(data[s : s+e])
+		}
+	}
+
+	if minCents > 0 && amt != "" {
+		cents := parseCents(amt)
+		if cents < minCents {
+			return
+		}
+	}
+
+	// Собираем доступные takers
+	fireTime := time.Now()
+
 	var available []*taker
 	for _, t := range takers {
 		if t.ready.Load() && t.inUse.CompareAndSwap(false, true) {
@@ -190,9 +245,7 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 		return
 	}
 
-	// Fire all in parallel
-	fireTime := time.Now()
-
+	// Fire все параллельно
 	var wg sync.WaitGroup
 	for _, t := range available {
 		wg.Add(1)
@@ -213,12 +266,12 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 
 	fireLatency := time.Since(fireTime).Microseconds()
 
-	// Read responses in parallel
+	// Читаем ответы ПАРАЛЛЕЛЬНО
 	type result struct {
 		id   int
 		code int
-		dur  time.Duration
 		err  bool
+		dur  time.Duration
 	}
 
 	resultCh := make(chan result, len(available))
@@ -226,12 +279,12 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 	for _, t := range available {
 		go func(tk *taker) {
 			start := time.Now()
-
 			tk.mu.Lock()
+
 			if tk.conn == nil {
 				tk.mu.Unlock()
 				tk.inUse.Store(false)
-				resultCh <- result{tk.id, 0, time.Since(start), true}
+				resultCh <- result{tk.id, 0, true, time.Since(start)}
 				go tk.connect()
 				return
 			}
@@ -245,7 +298,7 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 				tk.ready.Store(false)
 				tk.mu.Unlock()
 				tk.inUse.Store(false)
-				resultCh <- result{tk.id, 0, time.Since(start), true}
+				resultCh <- result{tk.id, 0, true, time.Since(start)}
 				go tk.connect()
 				return
 			}
@@ -262,11 +315,11 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 
 			tk.mu.Unlock()
 			tk.inUse.Store(false)
-			resultCh <- result{tk.id, code, time.Since(start), false}
+			resultCh <- result{tk.id, code, false, time.Since(start)}
 		}(t)
 	}
 
-	// Collect results
+	// Собираем результаты
 	var results []result
 	for range available {
 		results = append(results, <-resultCh)
@@ -280,10 +333,10 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 		if r.err {
 			parts = append(parts, fmt.Sprintf("T%d:ERR", r.id))
 		} else if r.code == 200 {
-			parts = append(parts, fmt.Sprintf("T%d:%d✓", r.id, r.dur.Milliseconds()))
+			parts = append(parts, fmt.Sprintf("T%d:OK", r.id))
 			won = true
 		} else {
-			parts = append(parts, fmt.Sprintf("T%d:%d(%d)", r.id, r.dur.Milliseconds(), r.code))
+			parts = append(parts, fmt.Sprintf("T%d:%d", r.id, r.code))
 		}
 	}
 
@@ -302,59 +355,6 @@ func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
 		fmt.Printf("   [WS%02d] LATE e2e=%dms fire=%dμs amt=%s | %s\n",
 			wsID, e2e, fireLatency, amt, strings.Join(parts, " "))
 	}
-
-	// Cleanup
-	go func() {
-		time.Sleep(5 * time.Second)
-		seenMu.Lock()
-		delete(seen, orderIDStr)
-		seenMu.Unlock()
-	}()
-}
-
-// ============ Parser ============
-
-var (
-	patternOpAdd = []byte(`"op":"add"`)
-	patternID    = []byte(`"id":"`)
-	patternAmt   = []byte(`"in_amount":"`)
-)
-
-func parseAndTake(data []byte, wsID int, detectTime time.Time, minCents int64) {
-	if !bytes.Contains(data, patternOpAdd) {
-		return
-	}
-
-	idx := bytes.Index(data, patternID)
-	if idx == -1 {
-		return
-	}
-
-	start := idx + 6
-	end := bytes.IndexByte(data[start:], '"')
-	if end == -1 || end > 30 {
-		return
-	}
-
-	orderID := data[start : start+end]
-
-	var amt string
-	if idx := bytes.Index(data, patternAmt); idx != -1 {
-		s := idx + 13
-		e := bytes.IndexByte(data[s:], '"')
-		if e != -1 && e < 20 {
-			amt = string(data[s : s+e])
-		}
-	}
-
-	if minCents > 0 && amt != "" {
-		cents := parseCents(amt)
-		if cents < minCents {
-			return
-		}
-	}
-
-	doTake(orderID, amt, wsID, detectTime)
 }
 
 func parseCents(amt string) int64 {
@@ -421,7 +421,7 @@ func runWS(wsID int, minCents int64) {
 					continue
 				}
 				if len(data) > 10 && data[0] == '4' && data[1] == '2' {
-					parseAndTake(data[2:], wsID, detectTime, minCents)
+					ultraFastTake(data[2:], wsID, detectTime, minCents)
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -487,7 +487,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  P2C SNIPER - 20 WS + 5 HTTP/1.1 Takers   ║")
+	fmt.Println("║  P2C SNIPER - Warmup 900ms                ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -535,12 +535,12 @@ func main() {
 	}
 	fmt.Printf("✅ %d/%d takers ready\n", ready, numTakers)
 
-	// Warmup goroutines
+	// Warmup goroutines - 900ms interval
 	for i, t := range takers {
 		go func(idx int, tk *taker) {
-			time.Sleep(time.Duration(idx*20) * time.Millisecond)
+			time.Sleep(time.Duration(idx*180) * time.Millisecond) // Stagger
 			for {
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(warmupMs * time.Millisecond)
 				if tk.ready.Load() {
 					tk.warmup()
 				} else {
@@ -558,7 +558,7 @@ func main() {
 	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Printf("  %d WS | %d takers | warmup 100ms\n", numWebSockets, numTakers)
+	fmt.Printf("  %d WS | %d takers | warmup %dms\n", numWebSockets, numTakers, warmupMs)
 	if minCents > 0 {
 		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
 	}
