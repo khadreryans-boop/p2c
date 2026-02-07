@@ -20,170 +20,66 @@ import (
 )
 
 const (
-	host           = "app.send.tg"
-	wsPath         = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
-	takePathPrefix = "/internal/v1/p2c/payments/take/"
-	numCurls       = 5
+	host   = "app.send.tg"
+	wsPath = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
+	wsURL  = "wss://app.send.tg/internal/v1/p2c-socket/?EIO=4&transport=websocket"
 )
 
-var (
-	cookie   string
-	serverIP string
-)
+var cookie string
+var serverIP string
 
 // Stats
 var (
-	rawWins   atomic.Int64
-	curlWins  atomic.Int64
-	totalSeen atomic.Int64
-	seenMu    sync.Mutex
-	seen      = make(map[string]struct{})
+	goWins   atomic.Int64
+	curlWins atomic.Int64
+	mu       sync.Mutex
+	orders   = make(map[string]string) // orderID -> who saw first
+	orderTs  = make(map[string]time.Time)
 )
 
-// HTTP/1.1 raw socket client
-type rawClient struct {
-	conn net.Conn
-	br   *bufio.Reader
-	bw   *bufio.Writer
-	mu   sync.Mutex
+func recordOrder(orderID, source string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if first, exists := orders[orderID]; exists {
+		delay := time.Since(orderTs[orderID]).Milliseconds()
+		fmt.Printf("   %s saw %s +%dms (first: %s)\n", source, orderID[:12], delay, first)
+		return
+	}
+
+	orders[orderID] = source
+	orderTs[orderID] = time.Now()
+
+	if source == "GO" {
+		goWins.Add(1)
+	} else {
+		curlWins.Add(1)
+	}
+
+	fmt.Printf("🥇 %s FIRST: %s (GO:%d CURL:%d)\n", source, orderID[:12], goWins.Load(), curlWins.Load())
+
+	// Cleanup after 10s
+	go func() {
+		time.Sleep(10 * time.Second)
+		mu.Lock()
+		delete(orders, orderID)
+		delete(orderTs, orderID)
+		mu.Unlock()
+	}()
 }
 
-func newRawClient() (*rawClient, error) {
-	conn, err := net.DialTimeout("tcp", serverIP+":443", 2*time.Second)
-	if err != nil {
-		return nil, err
-	}
+// ============ Go WebSocket ============
 
-	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
-	}
-
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	return &rawClient{
-		conn: tlsConn,
-		br:   bufio.NewReaderSize(tlsConn, 4096),
-		bw:   bufio.NewWriterSize(tlsConn, 2048),
-	}, nil
-}
-
-func (c *rawClient) take(orderID string) (int, time.Duration, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.conn.SetDeadline(time.Now().Add(2 * time.Second))
-
-	req := fmt.Sprintf("POST %s%s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"Cookie: %s\r\n"+
-		"Content-Type: application/json\r\n"+
-		"Content-Length: 2\r\n"+
-		"Connection: keep-alive\r\n\r\n{}",
-		takePathPrefix, orderID, host, cookie)
-
-	start := time.Now()
-	c.bw.WriteString(req)
-	if err := c.bw.Flush(); err != nil {
-		return 0, 0, err
-	}
-
-	line, err := c.br.ReadString('\n')
-	dur := time.Since(start)
-
-	if err != nil {
-		return 0, dur, err
-	}
-
-	if len(line) < 12 {
-		return 0, dur, fmt.Errorf("short")
-	}
-
-	code := 0
-	fmt.Sscanf(line[9:12], "%d", &code)
-
-	// Drain headers
+func runGoWS() {
 	for {
-		l, _ := c.br.ReadString('\n')
-		if l == "\r\n" || l == "" {
-			break
-		}
-	}
-
-	return code, dur, nil
-}
-
-func (c *rawClient) warmup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-
-	req := "POST /internal/v1/p2c/accounts HTTP/1.1\r\n" +
-		"Host: " + host + "\r\n" +
-		"Cookie: " + cookie + "\r\n" +
-		"Content-Type: application/json\r\n" +
-		"Content-Length: 2\r\n" +
-		"Connection: keep-alive\r\n\r\n{}"
-
-	c.bw.WriteString(req)
-	c.bw.Flush()
-	c.br.ReadString('\n')
-
-	for {
-		l, _ := c.br.ReadString('\n')
-		if l == "\r\n" || l == "" {
-			break
-		}
-	}
-}
-
-// Curl fire-and-forget with result
-func curlTake(id int, orderID string, ch chan<- curlResult) {
-	url := fmt.Sprintf("https://%s%s%s", host, takePathPrefix, orderID)
-
-	start := time.Now()
-
-	cmd := exec.Command("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-		"-X", "POST",
-		"-H", "Cookie: "+cookie,
-		"-H", "Content-Type: application/json",
-		"-d", "{}",
-		"--connect-timeout", "2",
-		"--max-time", "3",
-		url)
-
-	output, err := cmd.Output()
-	dur := time.Since(start)
-
-	code := 0
-	if err == nil {
-		fmt.Sscanf(string(output), "%d", &code)
-	}
-
-	ch <- curlResult{id, code, dur, err}
-}
-
-type curlResult struct {
-	id   int
-	code int
-	dur  time.Duration
-	err  error
-}
-
-// WebSocket listener
-func runWS(raw *rawClient) {
-	for {
-		conn, err := connectWS()
+		conn, err := connectGoWS()
 		if err != nil {
-			fmt.Printf("[WS] connect err: %v\n", err)
+			fmt.Printf("[GO] connect err: %v\n", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
+		// Handshake
 		readFrame(conn)
 		writeFrame(conn, []byte("40"))
 		readFrame(conn)
@@ -193,11 +89,12 @@ func runWS(raw *rawClient) {
 		time.Sleep(30 * time.Millisecond)
 		writeFrame(conn, []byte(`42["list:snapshot",[]]`))
 
-		fmt.Println("[WS] 🚀 connected")
+		fmt.Println("[GO] 🚀 connected")
 
 		for {
 			data, op, err := readFrame(conn)
 			if err != nil {
+				fmt.Printf("[GO] err: %v\n", err)
 				break
 			}
 
@@ -207,7 +104,7 @@ func runWS(raw *rawClient) {
 					continue
 				}
 				if len(data) > 2 && data[0] == '4' && data[1] == '2' {
-					handleOrder(data[2:], raw)
+					parseOrder(data[2:], "GO")
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -223,126 +120,7 @@ func runWS(raw *rawClient) {
 	}
 }
 
-func handleOrder(data []byte, raw *rawClient) {
-	if !bytes.Contains(data, []byte(`"op":"add"`)) {
-		return
-	}
-
-	idIdx := bytes.Index(data, []byte(`"id":"`))
-	if idIdx == -1 {
-		return
-	}
-	start := idIdx + 6
-	end := bytes.IndexByte(data[start:], '"')
-	if end == -1 || end > 30 {
-		return
-	}
-	orderID := string(data[start : start+end])
-
-	// Dedupe
-	seenMu.Lock()
-	if _, ok := seen[orderID]; ok {
-		seenMu.Unlock()
-		return
-	}
-	seen[orderID] = struct{}{}
-	seenMu.Unlock()
-
-	totalSeen.Add(1)
-
-	// Parse amount
-	var amt string
-	if idx := bytes.Index(data, []byte(`"in_amount":"`)); idx != -1 {
-		s := idx + 13
-		e := bytes.IndexByte(data[s:], '"')
-		if e != -1 && e < 20 {
-			amt = string(data[s : s+e])
-		}
-	}
-
-	// Race RAW vs 5 CURL (fire all, wait for first response)
-	type result struct {
-		name string
-		code int
-		dur  time.Duration
-		err  error
-	}
-
-	resultCh := make(chan result, 1+numCurls)
-
-	// Fire RAW
-	go func() {
-		code, dur, err := raw.take(orderID)
-		resultCh <- result{"RAW", code, dur, err}
-	}()
-
-	// Fire 5 CURLs
-	curlCh := make(chan curlResult, numCurls)
-	for i := 1; i <= numCurls; i++ {
-		go curlTake(i, orderID, curlCh)
-	}
-
-	// Collect curl results and send fastest
-	go func() {
-		var fastest *curlResult
-		for i := 0; i < numCurls; i++ {
-			r := <-curlCh
-			if fastest == nil || r.dur < fastest.dur {
-				fastest = &r
-			}
-		}
-		if fastest != nil {
-			resultCh <- result{fmt.Sprintf("CURL%d", fastest.id), fastest.code, fastest.dur, fastest.err}
-		}
-	}()
-
-	// Wait for RAW and best CURL
-	r1 := <-resultCh
-	r2 := <-resultCh
-
-	// Determine winner
-	var winner, loser result
-	if r1.dur < r2.dur {
-		winner, loser = r1, r2
-	} else {
-		winner, loser = r2, r1
-	}
-
-	if winner.name == "RAW" {
-		rawWins.Add(1)
-	} else {
-		curlWins.Add(1)
-	}
-
-	winStr := fmt.Sprintf("%s:%dms", winner.name, winner.dur.Milliseconds())
-	if winner.err != nil {
-		winStr = fmt.Sprintf("%s:ERR", winner.name)
-	} else {
-		winStr = fmt.Sprintf("%s:%dms(%d)", winner.name, winner.dur.Milliseconds(), winner.code)
-	}
-
-	loseStr := fmt.Sprintf("%s:%dms", loser.name, loser.dur.Milliseconds())
-	if loser.err != nil {
-		loseStr = fmt.Sprintf("%s:ERR", loser.name)
-	} else {
-		loseStr = fmt.Sprintf("%s:%dms(%d)", loser.name, loser.dur.Milliseconds(), loser.code)
-	}
-
-	diff := loser.dur.Milliseconds() - winner.dur.Milliseconds()
-
-	fmt.Printf("🏁 %s wins (+%dms) | %s vs %s | amt=%s (RAW:%d CURL:%d)\n",
-		winner.name, diff, winStr, loseStr, amt, rawWins.Load(), curlWins.Load())
-
-	// Cleanup
-	go func() {
-		time.Sleep(5 * time.Second)
-		seenMu.Lock()
-		delete(seen, orderID)
-		seenMu.Unlock()
-	}()
-}
-
-func connectWS() (net.Conn, error) {
+func connectGoWS() (net.Conn, error) {
 	dialer := ws.Dialer{
 		Header: ws.HandshakeHeaderHTTP(http.Header{
 			"Cookie": []string{cookie},
@@ -386,11 +164,124 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
+// ============ Curl WebSocket ============
+
+func runCurlWS() {
+	for {
+		err := runCurlWSSession()
+		if err != nil {
+			fmt.Printf("[CURL] session err: %v\n", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func runCurlWSSession() error {
+	// curl --ws with headers
+	cmd := exec.Command("curl",
+		"--ws", "-s", "-N",
+		"-H", "Cookie: "+cookie,
+		"-H", "Origin: https://app.send.tg",
+		wsURL)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	defer func() {
+		stdin.Close()
+		cmd.Process.Kill()
+		cmd.Wait()
+	}()
+
+	reader := bufio.NewReader(stdout)
+
+	// Read Engine.IO open packet
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read open: %v", err)
+	}
+	_ = line
+
+	// Send Socket.IO connect
+	stdin.Write([]byte("40\n"))
+
+	// Read connect ack
+	line, err = reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read ack: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	stdin.Write([]byte(`42["list:initialize"]` + "\n"))
+	time.Sleep(30 * time.Millisecond)
+	stdin.Write([]byte(`42["list:snapshot",[]]` + "\n"))
+
+	fmt.Println("[CURL] 🚀 connected")
+
+	// Read loop
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read: %v", err)
+		}
+
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		// Ping
+		if line == "2" {
+			stdin.Write([]byte("3\n"))
+			continue
+		}
+
+		// Message
+		if len(line) > 2 && line[0] == '4' && line[1] == '2' {
+			parseOrder([]byte(line[2:]), "CURL")
+		}
+	}
+}
+
+// ============ Parser ============
+
+func parseOrder(data []byte, source string) {
+	if !bytes.Contains(data, []byte(`"op":"add"`)) {
+		return
+	}
+
+	idIdx := bytes.Index(data, []byte(`"id":"`))
+	if idIdx == -1 {
+		return
+	}
+	start := idIdx + 6
+	end := bytes.IndexByte(data[start:], '"')
+	if end == -1 || end > 30 {
+		return
+	}
+	orderID := string(data[start : start+end])
+
+	recordOrder(orderID, source)
+}
+
+// ============ Main ============
+
 func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: Raw Socket vs 5x Curl              ║")
+	fmt.Println("║  RACE: Go WebSocket vs Curl WebSocket     ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -410,50 +301,51 @@ func main() {
 	serverIP = ips[0]
 	fmt.Printf("✅ Server IP: %s\n", serverIP)
 
-	// Create raw client
-	fmt.Println("\n⏳ Creating Raw Socket client...")
-	raw, err := newRawClient()
-	if err != nil {
-		fmt.Printf("Raw error: %v\n", err)
-		return
-	}
-	fmt.Println("✅ Raw Socket ready")
-
-	// Test curl
-	fmt.Println("⏳ Testing curl...")
+	// Check curl version for --ws support
+	fmt.Println("\n⏳ Checking curl WebSocket support...")
 	cmd := exec.Command("curl", "--version")
 	output, err := cmd.Output()
 	if err != nil {
 		fmt.Printf("curl not found: %v\n", err)
 		return
 	}
-	fmt.Printf("✅ %s\n", strings.Split(string(output), "\n")[0])
+	version := strings.Split(string(output), "\n")[0]
+	fmt.Printf("✅ %s\n", version)
 
-	// Warmup raw socket
-	go func() {
-		for {
-			time.Sleep(500 * time.Millisecond)
-			raw.warmup()
-		}
-	}()
+	// Test if curl supports --ws
+	testCmd := exec.Command("curl", "--ws", "-s", "--help")
+	if err := testCmd.Run(); err != nil {
+		fmt.Println("❌ curl --ws not supported (need curl >= 7.86)")
+		fmt.Println("   Falling back to Go-only mode")
+
+		// Run only Go WebSocket
+		go runGoWS()
+
+		select {}
+	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  RAW = 1x HTTP/1.1 persistent connection")
-	fmt.Println("  CURL = 5x parallel curl processes")
-	fmt.Println("  Winner = fastest response")
+	fmt.Println("  GO = gobwas/ws library")
+	fmt.Println("  CURL = curl --ws")
+	fmt.Println("  🥇 = first to see order")
 	fmt.Println("════════════════════════════════════════════\n")
 
-	// Start WebSocket
-	go runWS(raw)
+	// Start Go WebSocket
+	go runGoWS()
+
+	time.Sleep(1 * time.Second)
+
+	// Start Curl WebSocket
+	go runCurlWS()
 
 	// Stats
 	go func() {
 		for {
 			time.Sleep(60 * time.Second)
-			rw, cw := rawWins.Load(), curlWins.Load()
-			total := rw + cw
-			fmt.Printf("\n📊 STATS: RAW=%d (%.0f%%) CURL=%d (%.0f%%) total=%d\n\n",
-				rw, float64(rw)/float64(max(total, 1))*100,
+			gw, cw := goWins.Load(), curlWins.Load()
+			total := gw + cw
+			fmt.Printf("\n📊 STATS: GO=%d (%.0f%%) CURL=%d (%.0f%%) total=%d\n\n",
+				gw, float64(gw)/float64(max(total, 1))*100,
 				cw, float64(cw)/float64(max(total, 1))*100,
 				total)
 		}
