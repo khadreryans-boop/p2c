@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fasthttp/websocket"
 	"github.com/gobwas/ws"
 )
 
@@ -30,11 +31,12 @@ var serverIP string
 
 // Stats
 var (
-	goWins     atomic.Int64
-	wsocatWins atomic.Int64
-	mu         sync.Mutex
-	orders     = make(map[string]string)
-	orderTs    = make(map[string]time.Time)
+	goWins       atomic.Int64
+	wsocatWins   atomic.Int64
+	fasthttpWins atomic.Int64
+	mu           sync.Mutex
+	orders       = make(map[string]string)
+	orderTs      = make(map[string]time.Time)
 )
 
 func recordOrder(orderID, source string) {
@@ -50,13 +52,17 @@ func recordOrder(orderID, source string) {
 	orders[orderID] = source
 	orderTs[orderID] = time.Now()
 
-	if source == "GO" {
+	switch source {
+	case "GO":
 		goWins.Add(1)
-	} else {
+	case "WSOCAT":
 		wsocatWins.Add(1)
+	case "FAST":
+		fasthttpWins.Add(1)
 	}
 
-	fmt.Printf("🥇 %s FIRST: %s (GO:%d WSOCAT:%d)\n", source, orderID[:12], goWins.Load(), wsocatWins.Load())
+	fmt.Printf("🥇 %s FIRST: %s (GO:%d FAST:%d WSOCAT:%d)\n",
+		source, orderID[:12], goWins.Load(), fasthttpWins.Load(), wsocatWins.Load())
 
 	go func() {
 		time.Sleep(10 * time.Second)
@@ -67,7 +73,7 @@ func recordOrder(orderID, source string) {
 	}()
 }
 
-// ============ Go WebSocket ============
+// ============ Go WebSocket (gobwas/ws) ============
 
 func runGoWS() {
 	for {
@@ -162,6 +168,84 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
+// ============ FastHTTP WebSocket ============
+
+func runFasthttpWS() {
+	for {
+		err := runFasthttpSession()
+		if err != nil {
+			fmt.Printf("[FAST] session err: %v\n", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func runFasthttpSession() error {
+	dialer := websocket.Dialer{
+		NetDial: func(network, addr string) (net.Conn, error) {
+			conn, err := net.DialTimeout("tcp", serverIP+":443", 5*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				tc.SetNoDelay(true)
+			}
+			return conn, nil
+		},
+		TLSClientConfig:  &tls.Config{ServerName: host},
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	header := http.Header{}
+	header.Set("Cookie", cookie)
+	header.Set("Origin", "https://app.send.tg")
+
+	conn, _, err := dialer.Dial(wsURL, header)
+	if err != nil {
+		return fmt.Errorf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Read Engine.IO open
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("read open: %v", err)
+	}
+	_ = msg
+
+	// Send Socket.IO connect
+	conn.WriteMessage(websocket.TextMessage, []byte("40"))
+
+	// Read connect ack
+	_, _, err = conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("read ack: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	conn.WriteMessage(websocket.TextMessage, []byte(`42["list:initialize"]`))
+	time.Sleep(30 * time.Millisecond)
+	conn.WriteMessage(websocket.TextMessage, []byte(`42["list:snapshot",[]]`))
+
+	fmt.Println("[FAST] 🚀 connected")
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read: %v", err)
+		}
+
+		if len(data) == 1 && data[0] == '2' {
+			conn.WriteMessage(websocket.TextMessage, []byte("3"))
+			continue
+		}
+
+		if len(data) > 2 && data[0] == '4' && data[1] == '2' {
+			parseOrder(data[2:], "FAST")
+		}
+	}
+}
+
 // ============ Websocat WebSocket ============
 
 func runWsocatWS() {
@@ -175,7 +259,6 @@ func runWsocatWS() {
 }
 
 func runWsocatSession() error {
-	// websocat with headers - use -H for headers, no -t
 	cmd := exec.Command("websocat", "-v",
 		"-H", "Cookie: "+cookie,
 		"-H", "Origin: https://app.send.tg",
@@ -201,11 +284,10 @@ func runWsocatSession() error {
 		return err
 	}
 
-	// Log stderr in background
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
-			fmt.Printf("[WSOCAT-DBG] %s\n", scanner.Text())
+			// Suppress debug output
 		}
 	}()
 
@@ -217,17 +299,14 @@ func runWsocatSession() error {
 
 	reader := bufio.NewReader(stdout)
 
-	// Read Engine.IO open packet
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("read open: %v", err)
 	}
-	fmt.Printf("[WSOCAT] got: %s\n", strings.TrimSpace(line))
+	_ = line
 
-	// Send Socket.IO connect
 	stdin.Write([]byte("40\n"))
 
-	// Read connect ack
 	line, err = reader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("read ack: %v", err)
@@ -240,7 +319,6 @@ func runWsocatSession() error {
 
 	fmt.Println("[WSOCAT] 🚀 connected")
 
-	// Read loop
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -252,13 +330,11 @@ func runWsocatSession() error {
 			continue
 		}
 
-		// Ping
 		if line == "2" {
 			stdin.Write([]byte("3\n"))
 			continue
 		}
 
-		// Message
 		if len(line) > 2 && line[0] == '4' && line[1] == '2' {
 			parseOrder([]byte(line[2:]), "WSOCAT")
 		}
@@ -292,7 +368,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: Go WebSocket vs Websocat           ║")
+	fmt.Println("║  RACE: gobwas vs fasthttp vs websocat     ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -317,36 +393,38 @@ func main() {
 	cmd := exec.Command("websocat", "--version")
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("❌ websocat not found: %v\n", err)
-		fmt.Println("\nInstall with:")
-		fmt.Println("  wget https://github.com/vi/websocat/releases/download/v1.12.0/websocat.x86_64-unknown-linux-musl -O /usr/local/bin/websocat")
-		fmt.Println("  chmod +x /usr/local/bin/websocat")
-		return
+		fmt.Printf("⚠️  websocat not found, skipping\n")
+	} else {
+		fmt.Printf("✅ %s", string(output))
 	}
-	fmt.Printf("✅ %s", string(output))
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  GO = gobwas/ws library")
-	fmt.Println("  WSOCAT = websocat CLI")
+	fmt.Println("  GO     = gobwas/ws (raw frames)")
+	fmt.Println("  FAST   = fasthttp/websocket")
+	fmt.Println("  WSOCAT = websocat CLI (Rust)")
 	fmt.Println("  🥇 = first to see order")
 	fmt.Println("════════════════════════════════════════════\n")
 
-	// Start Go WebSocket
+	// Start all WebSockets
 	go runGoWS()
+	time.Sleep(500 * time.Millisecond)
 
-	time.Sleep(1 * time.Second)
+	go runFasthttpWS()
+	time.Sleep(500 * time.Millisecond)
 
-	// Start Websocat WebSocket
-	go runWsocatWS()
+	if err == nil {
+		go runWsocatWS()
+	}
 
 	// Stats
 	go func() {
 		for {
 			time.Sleep(60 * time.Second)
-			gw, ww := goWins.Load(), wsocatWins.Load()
-			total := gw + ww
-			fmt.Printf("\n📊 STATS: GO=%d (%.0f%%) WSOCAT=%d (%.0f%%) total=%d\n\n",
+			gw, fw, ww := goWins.Load(), fasthttpWins.Load(), wsocatWins.Load()
+			total := gw + fw + ww
+			fmt.Printf("\n📊 STATS: GO=%d (%.0f%%) FAST=%d (%.0f%%) WSOCAT=%d (%.0f%%) total=%d\n\n",
 				gw, float64(gw)/float64(max(total, 1))*100,
+				fw, float64(fw)/float64(max(total, 1))*100,
 				ww, float64(ww)/float64(max(total, 1))*100,
 				total)
 		}
