@@ -30,11 +30,11 @@ var serverIP string
 
 // Stats
 var (
-	goWins   atomic.Int64
-	curlWins atomic.Int64
-	mu       sync.Mutex
-	orders   = make(map[string]string) // orderID -> who saw first
-	orderTs  = make(map[string]time.Time)
+	goWins     atomic.Int64
+	wsocatWins atomic.Int64
+	mu         sync.Mutex
+	orders     = make(map[string]string)
+	orderTs    = make(map[string]time.Time)
 )
 
 func recordOrder(orderID, source string) {
@@ -53,12 +53,11 @@ func recordOrder(orderID, source string) {
 	if source == "GO" {
 		goWins.Add(1)
 	} else {
-		curlWins.Add(1)
+		wsocatWins.Add(1)
 	}
 
-	fmt.Printf("🥇 %s FIRST: %s (GO:%d CURL:%d)\n", source, orderID[:12], goWins.Load(), curlWins.Load())
+	fmt.Printf("🥇 %s FIRST: %s (GO:%d WSOCAT:%d)\n", source, orderID[:12], goWins.Load(), wsocatWins.Load())
 
-	// Cleanup after 10s
 	go func() {
 		time.Sleep(10 * time.Second)
 		mu.Lock()
@@ -79,7 +78,6 @@ func runGoWS() {
 			continue
 		}
 
-		// Handshake
 		readFrame(conn)
 		writeFrame(conn, []byte("40"))
 		readFrame(conn)
@@ -164,24 +162,23 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
-// ============ Curl WebSocket ============
+// ============ Websocat WebSocket ============
 
-func runCurlWS() {
+func runWsocatWS() {
 	for {
-		err := runCurlWSSession()
+		err := runWsocatSession()
 		if err != nil {
-			fmt.Printf("[CURL] session err: %v\n", err)
+			fmt.Printf("[WSOCAT] session err: %v\n", err)
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-func runCurlWSSession() error {
-	// curl --ws with headers
-	cmd := exec.Command("curl",
-		"--ws", "-s", "-N",
-		"-H", "Cookie: "+cookie,
-		"-H", "Origin: https://app.send.tg",
+func runWsocatSession() error {
+	// websocat with headers
+	cmd := exec.Command("websocat", "-t",
+		"--header", "Cookie: "+cookie,
+		"--header", "Origin: https://app.send.tg",
 		wsURL)
 
 	stdout, err := cmd.StdoutPipe()
@@ -227,7 +224,7 @@ func runCurlWSSession() error {
 	time.Sleep(30 * time.Millisecond)
 	stdin.Write([]byte(`42["list:snapshot",[]]` + "\n"))
 
-	fmt.Println("[CURL] 🚀 connected")
+	fmt.Println("[WSOCAT] 🚀 connected")
 
 	// Read loop
 	for {
@@ -249,7 +246,7 @@ func runCurlWSSession() error {
 
 		// Message
 		if len(line) > 2 && line[0] == '4' && line[1] == '2' {
-			parseOrder([]byte(line[2:]), "CURL")
+			parseOrder([]byte(line[2:]), "WSOCAT")
 		}
 	}
 }
@@ -281,7 +278,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: Go WebSocket vs Curl WebSocket     ║")
+	fmt.Println("║  RACE: Go WebSocket vs Websocat           ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -301,32 +298,22 @@ func main() {
 	serverIP = ips[0]
 	fmt.Printf("✅ Server IP: %s\n", serverIP)
 
-	// Check curl version for --ws support
-	fmt.Println("\n⏳ Checking curl WebSocket support...")
-	cmd := exec.Command("curl", "--version")
+	// Check websocat
+	fmt.Println("\n⏳ Checking websocat...")
+	cmd := exec.Command("websocat", "--version")
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("curl not found: %v\n", err)
+		fmt.Printf("❌ websocat not found: %v\n", err)
+		fmt.Println("\nInstall with:")
+		fmt.Println("  wget https://github.com/vi/websocat/releases/download/v1.12.0/websocat.x86_64-unknown-linux-musl -O /usr/local/bin/websocat")
+		fmt.Println("  chmod +x /usr/local/bin/websocat")
 		return
 	}
-	version := strings.Split(string(output), "\n")[0]
-	fmt.Printf("✅ %s\n", version)
-
-	// Test if curl supports --ws
-	testCmd := exec.Command("curl", "--ws", "-s", "--help")
-	if err := testCmd.Run(); err != nil {
-		fmt.Println("❌ curl --ws not supported (need curl >= 7.86)")
-		fmt.Println("   Falling back to Go-only mode")
-
-		// Run only Go WebSocket
-		go runGoWS()
-
-		select {}
-	}
+	fmt.Printf("✅ %s", string(output))
 
 	fmt.Println("\n════════════════════════════════════════════")
 	fmt.Println("  GO = gobwas/ws library")
-	fmt.Println("  CURL = curl --ws")
+	fmt.Println("  WSOCAT = websocat CLI")
 	fmt.Println("  🥇 = first to see order")
 	fmt.Println("════════════════════════════════════════════\n")
 
@@ -335,18 +322,18 @@ func main() {
 
 	time.Sleep(1 * time.Second)
 
-	// Start Curl WebSocket
-	go runCurlWS()
+	// Start Websocat WebSocket
+	go runWsocatWS()
 
 	// Stats
 	go func() {
 		for {
 			time.Sleep(60 * time.Second)
-			gw, cw := goWins.Load(), curlWins.Load()
-			total := gw + cw
-			fmt.Printf("\n📊 STATS: GO=%d (%.0f%%) CURL=%d (%.0f%%) total=%d\n\n",
+			gw, ww := goWins.Load(), wsocatWins.Load()
+			total := gw + ww
+			fmt.Printf("\n📊 STATS: GO=%d (%.0f%%) WSOCAT=%d (%.0f%%) total=%d\n\n",
 				gw, float64(gw)/float64(max(total, 1))*100,
-				cw, float64(cw)/float64(max(total, 1))*100,
+				ww, float64(ww)/float64(max(total, 1))*100,
 				total)
 		}
 	}()
