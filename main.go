@@ -23,6 +23,7 @@ const (
 	host           = "app.send.tg"
 	wsPath         = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
 	takePathPrefix = "/internal/v1/p2c/payments/take/"
+	numCurls       = 5
 )
 
 var (
@@ -140,8 +141,8 @@ func (c *rawClient) warmup() {
 	}
 }
 
-// Curl client
-func curlTake(orderID string) (int, time.Duration, error) {
+// Curl fire-and-forget with result
+func curlTake(id int, orderID string, ch chan<- curlResult) {
 	url := fmt.Sprintf("https://%s%s%s", host, takePathPrefix, orderID)
 
 	start := time.Now()
@@ -158,14 +159,19 @@ func curlTake(orderID string) (int, time.Duration, error) {
 	output, err := cmd.Output()
 	dur := time.Since(start)
 
-	if err != nil {
-		return 0, dur, err
+	code := 0
+	if err == nil {
+		fmt.Sscanf(string(output), "%d", &code)
 	}
 
-	code := 0
-	fmt.Sscanf(string(output), "%d", &code)
+	ch <- curlResult{id, code, dur, err}
+}
 
-	return code, dur, nil
+type curlResult struct {
+	id   int
+	code int
+	dur  time.Duration
+	err  error
 }
 
 // WebSocket listener
@@ -254,7 +260,7 @@ func handleOrder(data []byte, raw *rawClient) {
 		}
 	}
 
-	// Race RAW vs CURL
+	// Race RAW vs 5 CURL (fire all, wait for first response)
 	type result struct {
 		name string
 		code int
@@ -262,22 +268,39 @@ func handleOrder(data []byte, raw *rawClient) {
 		err  error
 	}
 
-	ch := make(chan result, 2)
+	resultCh := make(chan result, 1+numCurls)
 
+	// Fire RAW
 	go func() {
 		code, dur, err := raw.take(orderID)
-		ch <- result{"RAW", code, dur, err}
+		resultCh <- result{"RAW", code, dur, err}
 	}()
 
+	// Fire 5 CURLs
+	curlCh := make(chan curlResult, numCurls)
+	for i := 1; i <= numCurls; i++ {
+		go curlTake(i, orderID, curlCh)
+	}
+
+	// Collect curl results and send fastest
 	go func() {
-		code, dur, err := curlTake(orderID)
-		ch <- result{"CURL", code, dur, err}
+		var fastest *curlResult
+		for i := 0; i < numCurls; i++ {
+			r := <-curlCh
+			if fastest == nil || r.dur < fastest.dur {
+				fastest = &r
+			}
+		}
+		if fastest != nil {
+			resultCh <- result{fmt.Sprintf("CURL%d", fastest.id), fastest.code, fastest.dur, fastest.err}
+		}
 	}()
 
-	r1 := <-ch
-	r2 := <-ch
+	// Wait for RAW and best CURL
+	r1 := <-resultCh
+	r2 := <-resultCh
 
-	// Determine winner (by duration)
+	// Determine winner
 	var winner, loser result
 	if r1.dur < r2.dur {
 		winner, loser = r1, r2
@@ -367,7 +390,7 @@ func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: Raw Socket vs Curl                 ║")
+	fmt.Println("║  RACE: Raw Socket vs 5x Curl              ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -415,9 +438,9 @@ func main() {
 	}()
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  RAW = HTTP/1.1 persistent connection")
-	fmt.Println("  CURL = new connection each request")
-	fmt.Println("  Both send take request simultaneously")
+	fmt.Println("  RAW = 1x HTTP/1.1 persistent connection")
+	fmt.Println("  CURL = 5x parallel curl processes")
+	fmt.Println("  Winner = fastest response")
 	fmt.Println("════════════════════════════════════════════\n")
 
 	// Start WebSocket
