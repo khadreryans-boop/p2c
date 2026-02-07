@@ -10,116 +10,112 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gobwas/ws"
-	"golang.org/x/net/http2"
 )
 
 const (
 	host           = "app.send.tg"
 	wsPath         = "/internal/v1/p2c-socket/?EIO=4&transport=websocket"
 	takePathPrefix = "/internal/v1/p2c/payments/take/"
+	pauseSeconds   = 20
+)
+
+const (
+	numWebSockets = 20
+	numTakers     = 5
 )
 
 var (
-	cookie   string
-	serverIP string
+	pauseTaking atomic.Bool
+	cookie      string
+	serverIP    string
+)
+
+// Pre-built request
+var reqPrefix []byte
+var reqSuffix []byte
+
+// Dedupe
+var (
+	seenMu sync.Mutex
+	seen   = make(map[string]struct{})
 )
 
 // Stats
 var (
-	h1Wins    atomic.Int64
-	h2Wins    atomic.Int64
 	totalSeen atomic.Int64
-	seenMu    sync.Mutex
-	seen      = make(map[string]struct{})
+	totalWon  atomic.Int64
+	totalLate atomic.Int64
 )
 
-// HTTP/1.1 client - raw socket for max speed
-type http1Client struct {
-	conn net.Conn
-	br   *bufio.Reader
-	bw   *bufio.Writer
-	mu   sync.Mutex
+// ============ Taker ============
+
+type taker struct {
+	conn  net.Conn
+	br    *bufio.Reader
+	bw    *bufio.Writer
+	mu    sync.Mutex
+	ready atomic.Bool
+	inUse atomic.Bool
+	id    int
 }
 
-func newHttp1Client() (*http1Client, error) {
+var takers []*taker
+
+func (t *taker) connect() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.conn != nil {
+		t.conn.Close()
+	}
+
 	conn, err := net.DialTimeout("tcp", serverIP+":443", 2*time.Second)
 	if err != nil {
-		return nil, err
+		t.ready.Store(false)
+		return err
 	}
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
-		return nil, err
+		t.ready.Store(false)
+		return err
 	}
 
-	return &http1Client{
-		conn: tlsConn,
-		br:   bufio.NewReaderSize(tlsConn, 4096),
-		bw:   bufio.NewWriterSize(tlsConn, 2048),
-	}, nil
+	t.conn = tlsConn
+	t.br = bufio.NewReaderSize(tlsConn, 4096)
+	t.bw = bufio.NewWriterSize(tlsConn, 2048)
+	t.ready.Store(true)
+	return nil
 }
 
-func (c *http1Client) take(orderID string) (int, time.Duration, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (t *taker) warmup() {
+	if !t.inUse.CompareAndSwap(false, true) {
+		return
+	}
+	defer t.inUse.Store(false)
 
-	c.conn.SetDeadline(time.Now().Add(2 * time.Second))
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	req := fmt.Sprintf("POST %s%s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"Cookie: %s\r\n"+
-		"Content-Type: application/json\r\n"+
-		"Content-Length: 2\r\n"+
-		"Connection: keep-alive\r\n\r\n{}",
-		takePathPrefix, orderID, host, cookie)
-
-	start := time.Now()
-	c.bw.WriteString(req)
-	if err := c.bw.Flush(); err != nil {
-		return 0, 0, err
+	if t.conn == nil {
+		return
 	}
 
-	line, err := c.br.ReadString('\n')
-	dur := time.Since(start)
-
-	if err != nil {
-		return 0, dur, err
-	}
-
-	if len(line) < 12 {
-		return 0, dur, fmt.Errorf("short")
-	}
-
-	code := 0
-	fmt.Sscanf(line[9:12], "%d", &code)
-
-	// Drain headers
-	for {
-		l, _ := c.br.ReadString('\n')
-		if l == "\r\n" || l == "" {
-			break
-		}
-	}
-
-	return code, dur, nil
-}
-
-func (c *http1Client) warmup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.conn.SetDeadline(time.Now().Add(1 * time.Second))
+	t.conn.SetDeadline(time.Now().Add(1 * time.Second))
 
 	req := "POST /internal/v1/p2c/accounts HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
@@ -128,93 +124,274 @@ func (c *http1Client) warmup() {
 		"Content-Length: 2\r\n" +
 		"Connection: keep-alive\r\n\r\n{}"
 
-	c.bw.WriteString(req)
-	c.bw.Flush()
-	c.br.ReadString('\n')
+	t.bw.WriteString(req)
+	if err := t.bw.Flush(); err != nil {
+		t.conn.Close()
+		t.conn = nil
+		t.ready.Store(false)
+		return
+	}
 
-	// Drain
+	line, err := t.br.ReadString('\n')
+	if err != nil {
+		t.conn.Close()
+		t.conn = nil
+		t.ready.Store(false)
+		return
+	}
+	_ = line
+
+	// Drain headers + body
+	contentLen := 0
 	for {
-		l, _ := c.br.ReadString('\n')
+		l, _ := t.br.ReadString('\n')
 		if l == "\r\n" || l == "" {
 			break
 		}
+		if strings.HasPrefix(strings.ToLower(l), "content-length:") {
+			fmt.Sscanf(l[15:], "%d", &contentLen)
+		}
+	}
+	if contentLen > 0 {
+		io.CopyN(io.Discard, t.br, int64(contentLen))
 	}
 }
 
-// HTTP/2 client
-type http2Client struct {
-	client *http.Client
-}
+// ============ Take Logic ============
 
-func newHttp2Client() *http2Client {
-	transport := &http2.Transport{
-		TLSClientConfig: &tls.Config{
-			ServerName: host,
-		},
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			conn, err := net.DialTimeout("tcp", serverIP+":443", 2*time.Second)
-			if err != nil {
-				return nil, err
+func doTake(orderID []byte, amt string, wsID int, detectTime time.Time) {
+	if pauseTaking.Load() {
+		return
+	}
+
+	orderIDStr := string(orderID)
+
+	seenMu.Lock()
+	if _, ok := seen[orderIDStr]; ok {
+		seenMu.Unlock()
+		return
+	}
+	seen[orderIDStr] = struct{}{}
+	seenMu.Unlock()
+
+	totalSeen.Add(1)
+
+	// Grab available takers
+	var available []*taker
+	for _, t := range takers {
+		if t.ready.Load() && t.inUse.CompareAndSwap(false, true) {
+			available = append(available, t)
+		}
+	}
+
+	if len(available) == 0 {
+		totalLate.Add(1)
+		fmt.Printf("   [WS%02d] NO TAKERS amt=%s\n", wsID, amt)
+		return
+	}
+
+	// Fire all in parallel
+	fireTime := time.Now()
+
+	var wg sync.WaitGroup
+	for _, t := range available {
+		wg.Add(1)
+		go func(tk *taker) {
+			defer wg.Done()
+			tk.mu.Lock()
+			if tk.conn != nil {
+				tk.conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+				tk.bw.Write(reqPrefix)
+				tk.bw.Write(orderID)
+				tk.bw.Write(reqSuffix)
+				tk.bw.Flush()
 			}
-			if tc, ok := conn.(*net.TCPConn); ok {
-				tc.SetNoDelay(true)
+			tk.mu.Unlock()
+		}(t)
+	}
+	wg.Wait()
+
+	fireLatency := time.Since(fireTime).Microseconds()
+
+	// Read responses in parallel
+	type result struct {
+		id   int
+		code int
+		dur  time.Duration
+		err  bool
+	}
+
+	resultCh := make(chan result, len(available))
+
+	for _, t := range available {
+		go func(tk *taker) {
+			start := time.Now()
+
+			tk.mu.Lock()
+			if tk.conn == nil {
+				tk.mu.Unlock()
+				tk.inUse.Store(false)
+				resultCh <- result{tk.id, 0, time.Since(start), true}
+				go tk.connect()
+				return
 			}
-			tlsConn := tls.Client(conn, cfg)
-			if err := tlsConn.Handshake(); err != nil {
-				conn.Close()
-				return nil, err
+
+			tk.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			line, err := tk.br.ReadString('\n')
+
+			if err != nil || len(line) < 12 {
+				tk.conn.Close()
+				tk.conn = nil
+				tk.ready.Store(false)
+				tk.mu.Unlock()
+				tk.inUse.Store(false)
+				resultCh <- result{tk.id, 0, time.Since(start), true}
+				go tk.connect()
+				return
 			}
-			return tlsConn, nil
-		},
+
+			code, _ := strconv.Atoi(line[9:12])
+
+			// Drain
+			for {
+				l, _ := tk.br.ReadString('\n')
+				if l == "\r\n" || l == "" {
+					break
+				}
+			}
+
+			tk.mu.Unlock()
+			tk.inUse.Store(false)
+			resultCh <- result{tk.id, code, time.Since(start), false}
+		}(t)
 	}
 
-	return &http2Client{
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   5 * time.Second,
-		},
+	// Collect results
+	var results []result
+	for range available {
+		results = append(results, <-resultCh)
 	}
+
+	e2e := time.Since(detectTime).Milliseconds()
+
+	var parts []string
+	var won bool
+	for _, r := range results {
+		if r.err {
+			parts = append(parts, fmt.Sprintf("T%d:ERR", r.id))
+		} else if r.code == 200 {
+			parts = append(parts, fmt.Sprintf("T%d:%d✓", r.id, r.dur.Milliseconds()))
+			won = true
+		} else {
+			parts = append(parts, fmt.Sprintf("T%d:%d(%d)", r.id, r.dur.Milliseconds(), r.code))
+		}
+	}
+
+	if won {
+		totalWon.Add(1)
+		fmt.Printf("✅ [WS%02d] e2e=%dms fire=%dμs amt=%s | %s\n",
+			wsID, e2e, fireLatency, amt, strings.Join(parts, " "))
+		pauseTaking.Store(true)
+		go func() {
+			time.Sleep(pauseSeconds * time.Second)
+			pauseTaking.Store(false)
+			fmt.Println("▶ Resumed")
+		}()
+	} else {
+		totalLate.Add(1)
+		fmt.Printf("   [WS%02d] LATE e2e=%dms fire=%dμs amt=%s | %s\n",
+			wsID, e2e, fireLatency, amt, strings.Join(parts, " "))
+	}
+
+	// Cleanup
+	go func() {
+		time.Sleep(5 * time.Second)
+		seenMu.Lock()
+		delete(seen, orderIDStr)
+		seenMu.Unlock()
+	}()
 }
 
-func (c *http2Client) take(orderID string) (int, time.Duration, error) {
-	url := "https://" + host + takePathPrefix + orderID
+// ============ Parser ============
 
-	req, _ := http.NewRequest("POST", url, strings.NewReader("{}"))
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("Content-Type", "application/json")
+var (
+	patternOpAdd = []byte(`"op":"add"`)
+	patternID    = []byte(`"id":"`)
+	patternAmt   = []byte(`"in_amount":"`)
+)
 
-	start := time.Now()
-	resp, err := c.client.Do(req)
-	dur := time.Since(start)
-
-	if err != nil {
-		return 0, dur, err
+func parseAndTake(data []byte, wsID int, detectTime time.Time, minCents int64) {
+	if !bytes.Contains(data, patternOpAdd) {
+		return
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
-	return resp.StatusCode, dur, nil
+	idx := bytes.Index(data, patternID)
+	if idx == -1 {
+		return
+	}
+
+	start := idx + 6
+	end := bytes.IndexByte(data[start:], '"')
+	if end == -1 || end > 30 {
+		return
+	}
+
+	orderID := data[start : start+end]
+
+	var amt string
+	if idx := bytes.Index(data, patternAmt); idx != -1 {
+		s := idx + 13
+		e := bytes.IndexByte(data[s:], '"')
+		if e != -1 && e < 20 {
+			amt = string(data[s : s+e])
+		}
+	}
+
+	if minCents > 0 && amt != "" {
+		cents := parseCents(amt)
+		if cents < minCents {
+			return
+		}
+	}
+
+	doTake(orderID, amt, wsID, detectTime)
 }
 
-func (c *http2Client) warmup() {
-	url := "https://" + host + "/internal/v1/p2c/accounts"
-	req, _ := http.NewRequest("POST", url, strings.NewReader("{}"))
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("Content-Type", "application/json")
+func parseCents(amt string) int64 {
+	var whole, frac int64
+	var fracDigits int
+	var seenDot bool
 
-	resp, err := c.client.Do(req)
-	if err == nil {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+	for i := 0; i < len(amt); i++ {
+		c := amt[i]
+		if c == '.' {
+			seenDot = true
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			d := int64(c - '0')
+			if !seenDot {
+				whole = whole*10 + d
+			} else if fracDigits < 2 {
+				frac = frac*10 + d
+				fracDigits++
+			}
+		}
 	}
+
+	if fracDigits == 1 {
+		frac *= 10
+	}
+
+	return whole*100 + frac
 }
 
-// WebSocket listener
-func runWS(h1 *http1Client, h2 *http2Client) {
+// ============ WebSocket ============
+
+func runWS(wsID int, minCents int64) {
 	for {
 		conn, err := connectWS()
 		if err != nil {
-			fmt.Printf("[WS] connect err: %v\n", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -228,10 +405,12 @@ func runWS(h1 *http1Client, h2 *http2Client) {
 		time.Sleep(30 * time.Millisecond)
 		writeFrame(conn, []byte(`42["list:snapshot",[]]`))
 
-		fmt.Println("[WS] 🚀 connected")
+		fmt.Printf("[WS%02d] 🚀\n", wsID)
 
 		for {
 			data, op, err := readFrame(conn)
+			detectTime := time.Now()
+
 			if err != nil {
 				break
 			}
@@ -241,8 +420,8 @@ func runWS(h1 *http1Client, h2 *http2Client) {
 					writeFrame(conn, []byte("3"))
 					continue
 				}
-				if len(data) > 2 && data[0] == '4' && data[1] == '2' {
-					handleOrder(data[2:], h1, h2)
+				if len(data) > 10 && data[0] == '4' && data[1] == '2' {
+					parseAndTake(data[2:], wsID, detectTime, minCents)
 				}
 			} else if op == ws.OpPing {
 				f := ws.NewPongFrame(data)
@@ -256,108 +435,6 @@ func runWS(h1 *http1Client, h2 *http2Client) {
 		conn.Close()
 		time.Sleep(1 * time.Second)
 	}
-}
-
-func handleOrder(data []byte, h1 *http1Client, h2 *http2Client) {
-	if !bytes.Contains(data, []byte(`"op":"add"`)) {
-		return
-	}
-
-	idIdx := bytes.Index(data, []byte(`"id":"`))
-	if idIdx == -1 {
-		return
-	}
-	start := idIdx + 6
-	end := bytes.IndexByte(data[start:], '"')
-	if end == -1 || end > 30 {
-		return
-	}
-	orderID := string(data[start : start+end])
-
-	// Dedupe
-	seenMu.Lock()
-	if _, ok := seen[orderID]; ok {
-		seenMu.Unlock()
-		return
-	}
-	seen[orderID] = struct{}{}
-	seenMu.Unlock()
-
-	totalSeen.Add(1)
-
-	// Parse amount
-	var amt string
-	if idx := bytes.Index(data, []byte(`"in_amount":"`)); idx != -1 {
-		s := idx + 13
-		e := bytes.IndexByte(data[s:], '"')
-		if e != -1 && e < 20 {
-			amt = string(data[s : s+e])
-		}
-	}
-
-	// Race HTTP/1.1 vs HTTP/2
-	type result struct {
-		name string
-		code int
-		dur  time.Duration
-		err  error
-	}
-
-	ch := make(chan result, 2)
-
-	go func() {
-		code, dur, err := h1.take(orderID)
-		ch <- result{"H1", code, dur, err}
-	}()
-
-	go func() {
-		code, dur, err := h2.take(orderID)
-		ch <- result{"H2", code, dur, err}
-	}()
-
-	r1 := <-ch
-	r2 := <-ch
-
-	// Determine winner
-	var winner, loser result
-	if r1.dur < r2.dur {
-		winner, loser = r1, r2
-	} else {
-		winner, loser = r2, r1
-	}
-
-	if strings.HasPrefix(winner.name, "H1") {
-		h1Wins.Add(1)
-	} else {
-		h2Wins.Add(1)
-	}
-
-	winStr := fmt.Sprintf("%s:%dms", winner.name, winner.dur.Milliseconds())
-	if winner.err != nil {
-		winStr = fmt.Sprintf("%s:ERR", winner.name)
-	} else if winner.code != 200 && winner.code != 400 {
-		winStr = fmt.Sprintf("%s:%dms(%d)", winner.name, winner.dur.Milliseconds(), winner.code)
-	}
-
-	loseStr := fmt.Sprintf("%s:%dms", loser.name, loser.dur.Milliseconds())
-	if loser.err != nil {
-		loseStr = fmt.Sprintf("%s:ERR", loser.name)
-	} else if loser.code != 200 && loser.code != 400 {
-		loseStr = fmt.Sprintf("%s:%dms(%d)", loser.name, loser.dur.Milliseconds(), loser.code)
-	}
-
-	diff := loser.dur.Milliseconds() - winner.dur.Milliseconds()
-
-	fmt.Printf("🏁 %s wins (+%dms) | %s vs %s | amt=%s (H1:%d H2:%d)\n",
-		winner.name, diff, winStr, loseStr, amt, h1Wins.Load(), h2Wins.Load())
-
-	// Cleanup
-	go func() {
-		time.Sleep(5 * time.Second)
-		seenMu.Lock()
-		delete(seen, orderID)
-		seenMu.Unlock()
-	}()
 }
 
 func connectWS() (net.Conn, error) {
@@ -404,11 +481,13 @@ func readFrame(conn net.Conn) ([]byte, ws.OpCode, error) {
 	return p, h.OpCode, nil
 }
 
+// ============ Main ============
+
 func main() {
 	in := bufio.NewReader(os.Stdin)
 
 	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  RACE: HTTP/1.1 vs HTTP/2 Take Requests   ║")
+	fmt.Println("║  P2C SNIPER - 20 WS + 5 HTTP/1.1 Takers   ║")
 	fmt.Println("╚═══════════════════════════════════════════╝")
 
 	fmt.Print("\naccess_token cookie:\n> ")
@@ -417,6 +496,15 @@ func main() {
 	if !strings.HasPrefix(cookie, "access_token=") {
 		fmt.Println("Invalid")
 		return
+	}
+
+	fmt.Print("MIN amount (0=all):\n> ")
+	minLine, _ := in.ReadString('\n')
+	minLine = strings.TrimSpace(minLine)
+	var minCents int64
+	if minLine != "" {
+		f, _ := strconv.ParseFloat(minLine, 64)
+		minCents = int64(f * 100)
 	}
 
 	fmt.Println("\n⏳ Resolving DNS...")
@@ -428,55 +516,61 @@ func main() {
 	serverIP = ips[0]
 	fmt.Printf("✅ Server IP: %s\n", serverIP)
 
-	// Create HTTP/1.1 client
-	fmt.Println("\n⏳ Creating HTTP/1.1 client...")
-	h1, err := newHttp1Client()
-	if err != nil {
-		fmt.Printf("H1 error: %v\n", err)
-		return
-	}
-	fmt.Println("✅ HTTP/1.1 ready")
+	reqPrefix = []byte("POST " + takePathPrefix)
+	reqSuffix = []byte(" HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: application/json\r\nCookie: " + cookie + "\r\nContent-Length: 2\r\n\r\n{}")
 
-	// Create HTTP/2 client
-	fmt.Println("⏳ Creating HTTP/2 client...")
-	h2 := newHttp2Client()
-	// Warmup to establish H2 connection
-	h2.warmup()
-	fmt.Println("✅ HTTP/2 ready")
+	// Create takers
+	fmt.Printf("\n⏳ Creating %d takers...\n", numTakers)
+	for i := 0; i < numTakers; i++ {
+		t := &taker{id: i + 1}
+		t.connect()
+		takers = append(takers, t)
+	}
+
+	ready := 0
+	for _, t := range takers {
+		if t.ready.Load() {
+			ready++
+		}
+	}
+	fmt.Printf("✅ %d/%d takers ready\n", ready, numTakers)
 
 	// Warmup goroutines
-	go func() {
-		for {
-			time.Sleep(200 * time.Millisecond)
-			h1.warmup()
-		}
-	}()
+	for i, t := range takers {
+		go func(idx int, tk *taker) {
+			time.Sleep(time.Duration(idx*20) * time.Millisecond)
+			for {
+				time.Sleep(100 * time.Millisecond)
+				if tk.ready.Load() {
+					tk.warmup()
+				} else {
+					tk.connect()
+				}
+			}
+		}(i, t)
+	}
 
-	go func() {
-		for {
-			time.Sleep(200 * time.Millisecond)
-			h2.warmup()
-		}
-	}()
+	// Start WebSockets
+	fmt.Printf("⏳ Starting %d WebSockets...\n", numWebSockets)
+	for i := 1; i <= numWebSockets; i++ {
+		go runWS(i, minCents)
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	fmt.Println("\n════════════════════════════════════════════")
-	fmt.Println("  HTTP/1.1 (raw socket) vs HTTP/2 (h2)")
-	fmt.Println("  Both send take request simultaneously")
+	fmt.Printf("  %d WS | %d takers | warmup 100ms\n", numWebSockets, numTakers)
+	if minCents > 0 {
+		fmt.Printf("  MIN: %.2f RUB\n", float64(minCents)/100)
+	}
 	fmt.Println("════════════════════════════════════════════\n")
-
-	// Start WebSocket
-	go runWS(h1, h2)
 
 	// Stats
 	go func() {
 		for {
 			time.Sleep(60 * time.Second)
-			h1w, h2w := h1Wins.Load(), h2Wins.Load()
-			total := h1w + h2w
-			fmt.Printf("\n📊 STATS: H1=%d (%.0f%%) H2=%d (%.0f%%) total=%d\n\n",
-				h1w, float64(h1w)/float64(max(total, 1))*100,
-				h2w, float64(h2w)/float64(max(total, 1))*100,
-				total)
+			s, w, l := totalSeen.Load(), totalWon.Load(), totalLate.Load()
+			rate := float64(w) / float64(max(s, 1)) * 100
+			fmt.Printf("\n📊 STATS: seen=%d won=%d late=%d (%.1f%%)\n\n", s, w, l, rate)
 		}
 	}()
 
