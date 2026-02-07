@@ -16,4 +16,7 @@ require (
 	github.com/gobwas/ws v1.4.0 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
+	nhooyr.io/websocket v1.8.17 // indirect
 )
